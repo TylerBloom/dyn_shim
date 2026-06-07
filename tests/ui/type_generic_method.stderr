@@ -1,0 +1,23 @@
+error: no rules expected `U`
+ --> tests/ui/type_generic_method.rs:3:36
+  |
+  3 | dyn_shim! { trait D for Src { fn g<U>(&self, x: U); } }
+    |                                    ^ no rules expected this token in macro call
+    |
+note: while trying to match meta-variable `$lt:lifetime`
+   --> src/lib.rs
+    |
+    |         fn $name:ident $(<$($lt:lifetime),+>)?
+    |                             ^^^^^^^^^^^^
+
+error: no rules expected `U`
+ --> tests/ui/type_generic_method.rs:3:36
+  |
+  3 | dyn_shim! { trait D for Src { fn g<U>(&self, x: U); } }
+    |                                    ^ no rules expected this token in macro call
+    |
+note: while trying to match meta-variable `$lt:lifetime`
+   --> src/lib.rs
+    |
+    |         fn $name:ident $(<$($lt:lifetime),+>)?
+    |                             ^^^^^^^^^^^^

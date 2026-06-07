@@ -1,0 +1,7 @@
+[package]
+name = "dyn_shim"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+trybuild = "1.0"

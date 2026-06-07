@@ -1,0 +1,23 @@
+error: no rules expected `,`
+ --> tests/ui/by_value_self.rs:3:46
+  |
+  3 | dyn_shim! { trait D for Src { fn consume(self, s: u8) -> u8; } }
+    |                                              ^ no rules expected this token in macro call
+    |
+note: while trying to match `:`
+   --> src/lib.rs
+    |
+    |             (self: Box<Self> $(, $arg:ident : $ty:ty)*) $(-> $ret:ty)? $([where $($w:tt)+])? ;
+    |                  ^
+
+error: no rules expected `,`
+ --> tests/ui/by_value_self.rs:3:46
+  |
+  3 | dyn_shim! { trait D for Src { fn consume(self, s: u8) -> u8; } }
+    |                                              ^ no rules expected this token in macro call
+    |
+note: while trying to match `:`
+   --> src/lib.rs
+    |
+    |             (self: Box<Self> $(, $arg:ident : $ty:ty)*) $(-> $ret:ty)? $([where $($w:tt)+])? ;
+    |                  ^

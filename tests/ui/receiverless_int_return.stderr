@@ -1,0 +1,23 @@
+error: no rules expected `)`
+ --> tests/ui/receiverless_int_return.rs:3:41
+  |
+  3 | dyn_shim! { trait D for Src { fn answer() -> i32; } }
+    |                                         ^ no rules expected this token in macro call
+    |
+note: while trying to match `&`
+   --> src/lib.rs
+    |
+    |             (&self $(, $arg:ident : $ty:ty)*) $(-> $ret:ty)? $([where $($w:tt)+])? ;
+    |              ^
+
+error: no rules expected `)`
+ --> tests/ui/receiverless_int_return.rs:3:41
+  |
+  3 | dyn_shim! { trait D for Src { fn answer() -> i32; } }
+    |                                         ^ no rules expected this token in macro call
+    |
+note: while trying to match `&`
+   --> src/lib.rs
+    |
+    |             (&self $(, $arg:ident : $ty:ty)*) $(-> $ret:ty)? $([where $($w:tt)+])? ;
+    |              ^
