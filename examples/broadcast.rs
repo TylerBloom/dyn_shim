@@ -1,24 +1,25 @@
 //! Broadcasting a message to a heterogeneous set of notification channels.
 //!
-//! `Channel` (below) is an ordinary trait, but it is NOT dyn-compatible. It has
-//! a by-value `close(self)` shutdown method and a receiverless `connect() ->
-//! Self` constructor. Either one alone is enough to make `Box<dyn Channel>`
-//! illegal, so you cannot keep a mixed list of channel types at runtime.
+//! `Channel` is not dyn-compatible. It has a by-value `close(self)` shutdown
+//! method and a receiverless `connect() -> Self` constructor, so you cannot keep
+//! a mixed list of channel types behind one `Box<dyn Channel>`.
 //!
-//! `dyn_shim!` generates a dyn-compatible `DynChannel` shim plus a blanket impl,
-//! forwarding only the methods that make sense behind a trait object. The
-//! by-value `close(self)` is exposed as `close(self: Box<Self>)`, and the
-//! receiverless `connect` is simply left out (you call it on the concrete
-//! type).
+//! `#[dyn_shim(DynChannel)]` reads the trait and generates a dyn-compatible
+//! `DynChannel` shim plus a blanket impl. It forwards `label`, `set_prefix`, and
+//! `deliver` unchanged, rewrites the by-value `close(self)` to
+//! `close(self: Box<Self>)`, and skips the receiverless `connect`.
+//!
+//! Run with: `cargo run --example broadcast`
 
 use dyn_shim::dyn_shim;
 
+#[dyn_shim(DynChannel)]
 trait Channel {
-    fn connect() -> Self;
+    fn connect() -> Self; // receiverless: skipped
     fn label(&self) -> String;
     fn set_prefix(&mut self, prefix: &str);
     fn deliver(&mut self, message: &str);
-    fn close(self) -> u32;
+    fn close(self) -> u32; // by-value self: forwarded as self: Box<Self>
 }
 
 struct Email {
@@ -35,20 +36,16 @@ impl Channel for Email {
             sent: 0,
         }
     }
-
     fn label(&self) -> String {
         format!("email<{}>", self.address)
     }
-
     fn set_prefix(&mut self, prefix: &str) {
         self.prefix = prefix.into();
     }
-
     fn deliver(&mut self, message: &str) {
         println!("  [email -> {}] {}{}", self.address, self.prefix, message);
         self.sent += 1;
     }
-
     fn close(self) -> u32 {
         self.sent
     }
@@ -68,41 +65,28 @@ impl Channel for Webhook {
             sent: 0,
         }
     }
-
     fn label(&self) -> String {
         format!("webhook<{}>", self.url)
     }
-
     fn set_prefix(&mut self, prefix: &str) {
         self.prefix = prefix.into();
     }
-
     fn deliver(&mut self, message: &str) {
         println!("  [webhook -> {}] {}{}", self.url, self.prefix, message);
         self.sent += 1;
     }
-
     fn close(self) -> u32 {
         self.sent
     }
 }
 
-dyn_shim! {
-    trait DynChannel for Channel {
-        fn label(&self) -> String;
-        fn set_prefix(&mut self, prefix: &str);
-        fn deliver(&mut self, message: &str);
-        fn close(self: Box<Self>) -> u32;  // forwards to Channel::close(*self)
-    }
-}
-
 fn main() {
-    // Now we have a DynChannel which *is* dyn-compatible.
+    // A mixed fleet of channels behind one erased type.
     let mut channels: Vec<Box<dyn DynChannel>> =
         vec![Box::new(Email::connect()), Box::new(Webhook::connect())];
 
     for ch in channels.iter_mut() {
-        ch.set_prefix("[staging] ");
+        ch.set_prefix("[prod] ");
     }
 
     let messages = ["deploy finished", "nightly backup completed"];

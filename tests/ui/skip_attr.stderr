@@ -1,0 +1,12 @@
+error[E0599]: no method named `internal` found for reference `&dyn Dyn` in the current scope
+  --> tests/ui/skip_attr.rs:23:15
+   |
+23 |     let _ = d.internal();
+   |               ^^^^^^^^ method not found in `&dyn Dyn`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+note: `Src` defines an item `internal`, perhaps you need to implement it
+  --> tests/ui/skip_attr.rs:4:1
+   |
+ 4 | trait Src {
+   | ^^^^^^^^^

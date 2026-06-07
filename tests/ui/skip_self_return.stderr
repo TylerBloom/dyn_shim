@@ -1,0 +1,12 @@
+error[E0599]: no method named `dup` found for reference `&dyn Dyn` in the current scope
+  --> tests/ui/skip_self_return.rs:22:15
+   |
+22 |     let _ = d.dup();
+   |               ^^^ method not found in `&dyn Dyn`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+note: `Src` defines an item `dup`, perhaps you need to implement it
+  --> tests/ui/skip_self_return.rs:4:1
+   |
+ 4 | trait Src {
+   | ^^^^^^^^^
