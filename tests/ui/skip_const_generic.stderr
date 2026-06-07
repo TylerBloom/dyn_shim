@@ -1,0 +1,12 @@
+error[E0599]: no method named `pick` found for reference `&dyn Dyn` in the current scope
+  --> tests/ui/skip_const_generic.rs:22:15
+   |
+22 |     let _ = d.pick::<3>();
+   |               ^^^^ method not found in `&dyn Dyn`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+note: `Src` defines an item `pick`, perhaps you need to implement it
+  --> tests/ui/skip_const_generic.rs:4:1
+   |
+ 4 | trait Src {
+   | ^^^^^^^^^

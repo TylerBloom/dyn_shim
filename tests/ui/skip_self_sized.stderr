@@ -1,0 +1,12 @@
+error[E0599]: no method named `sized_only` found for reference `&dyn Dyn` in the current scope
+  --> tests/ui/skip_self_sized.rs:26:15
+   |
+26 |     let _ = d.sized_only();
+   |               ^^^^^^^^^^ method not found in `&dyn Dyn`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+note: `Src` defines an item `sized_only`, perhaps you need to implement it
+  --> tests/ui/skip_self_sized.rs:6:1
+   |
+ 6 | trait Src {
+   | ^^^^^^^^^
