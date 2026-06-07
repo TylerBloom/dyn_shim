@@ -2,6 +2,13 @@
 name = "dyn_shim"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Generate dyn-compatible shim traits"
+repository = "https://github.com/nixpulvis/dyn_shim"
+documentation = "https://docs.rs/dyn_shim"
+readme = "README.md"
+keywords = ["dyn-compatible", "dyn-safe", "trait", "proc-macro", "macro"]
+categories = ["rust-patterns"]
 
 [lib]
 proc-macro = true
