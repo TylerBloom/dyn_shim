@@ -1,0 +1,12 @@
+error[E0599]: no method named `eq_self` found for reference `&dyn Dyn` in the current scope
+  --> tests/ui/skip_self_arg.rs:22:15
+   |
+22 |     let _ = d.eq_self(&S);
+   |               ^^^^^^^ method not found in `&dyn Dyn`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+note: `Src` defines an item `eq_self`, perhaps you need to implement it
+  --> tests/ui/skip_self_arg.rs:4:1
+   |
+ 4 | trait Src {
+   | ^^^^^^^^^

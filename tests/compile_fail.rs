@@ -7,8 +7,12 @@ fn skipped_methods_absent_from_shim() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/skip_receiverless.rs");
     t.compile_fail("tests/ui/skip_generic.rs");
+    t.compile_fail("tests/ui/skip_const_generic.rs");
     t.compile_fail("tests/ui/skip_async.rs");
     t.compile_fail("tests/ui/skip_self_return.rs");
+    t.compile_fail("tests/ui/skip_self_arg.rs");
     t.compile_fail("tests/ui/skip_impl_trait_arg.rs");
+    t.compile_fail("tests/ui/skip_impl_trait_ret.rs");
+    t.compile_fail("tests/ui/skip_self_sized.rs");
     t.compile_fail("tests/ui/skip_attr.rs");
 }

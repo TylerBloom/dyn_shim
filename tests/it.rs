@@ -1,5 +1,8 @@
 use dyn_shim::dyn_shim;
 use std::fmt::Display;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
 
 #[allow(dead_code)]
 #[dyn_shim(DynTrait)]
@@ -148,4 +151,105 @@ fn heterogeneous_existential() {
 
     let out: Vec<String> = zoo.into_iter().map(|x| x.consume("#")).collect();
     assert_eq!(out, vec!["Foo gone:101#", "Bar gone:hi!#"]);
+}
+
+// Every dispatchable receiver type is forwarded into the shim: `&self`,
+// `&mut self`, and the explicit smart-pointer receivers `Box<Self>`,
+// `Rc<Self>`, `Arc<Self>`, and `Pin<&mut Self>`.
+#[dyn_shim(DynRecv)]
+trait Receivers {
+    fn by_ref(&self) -> i32;
+    fn by_mut(&mut self) -> i32;
+    fn by_box(self: Box<Self>) -> i32;
+    fn by_rc(self: Rc<Self>) -> i32;
+    fn by_arc(self: Arc<Self>) -> i32;
+    fn by_pin(self: Pin<&mut Self>) -> i32;
+}
+
+struct Recv(i32);
+impl Receivers for Recv {
+    fn by_ref(&self) -> i32 {
+        self.0
+    }
+    fn by_mut(&mut self) -> i32 {
+        self.0 += 1;
+        self.0
+    }
+    fn by_box(self: Box<Self>) -> i32 {
+        self.0 + 10
+    }
+    fn by_rc(self: Rc<Self>) -> i32 {
+        self.0 + 20
+    }
+    fn by_arc(self: Arc<Self>) -> i32 {
+        self.0 + 30
+    }
+    fn by_pin(self: Pin<&mut Self>) -> i32 {
+        self.0 + 40
+    }
+}
+
+#[test]
+fn ref_receivers() {
+    let r: &dyn DynRecv = &Recv(1);
+    assert_eq!(r.by_ref(), 1);
+
+    let mut owned = Recv(1);
+    let m: &mut dyn DynRecv = &mut owned;
+    assert_eq!(m.by_mut(), 2);
+}
+
+#[test]
+fn box_receiver() {
+    let b: Box<dyn DynRecv> = Box::new(Recv(1));
+    assert_eq!(b.by_box(), 11);
+}
+
+#[test]
+fn rc_receiver() {
+    let rc: Rc<dyn DynRecv> = Rc::new(Recv(1));
+    assert_eq!(rc.by_rc(), 21);
+}
+
+#[test]
+fn arc_receiver() {
+    let arc: Arc<dyn DynRecv> = Arc::new(Recv(1));
+    assert_eq!(arc.by_arc(), 31);
+}
+
+#[test]
+fn pin_receiver() {
+    let mut pinned: Pin<Box<dyn DynRecv>> = Box::pin(Recv(1));
+    assert_eq!(pinned.as_mut().by_pin(), 41);
+}
+
+// A source trait that is itself not dyn-compatible (it carries an associated
+// const and an associated type) still yields a working shim from its
+// dispatchable methods. Associated items are not copied onto the shim, and the
+// method that returns the associated type is skipped because it mentions Self.
+#[allow(dead_code)]
+#[dyn_shim(DynAssoc)]
+trait HasAssoc {
+    const TAG: u8;
+    type Item;
+    fn label(&self) -> String;
+    fn item(&self) -> Self::Item;
+}
+
+struct Assoc;
+impl HasAssoc for Assoc {
+    const TAG: u8 = 9;
+    type Item = i32;
+    fn label(&self) -> String {
+        "Assoc".into()
+    }
+    fn item(&self) -> i32 {
+        1
+    }
+}
+
+#[test]
+fn assoc_items_trait_shimmed() {
+    let d: &dyn DynAssoc = &Assoc;
+    assert_eq!(d.label(), "Assoc");
 }

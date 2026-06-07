@@ -1,35 +1,14 @@
 //! Generate a dyn-compatible shim trait and blanket impl from a source trait
 //! that is not dyn-compatible.
 //!
-//! A by-value `self` method, a receiverless constructor, or a generic method
-//! makes a trait not dyn-compatible, so you cannot hold a mixed set of
+//! Some traits are not dyn-compatible, so you cannot hold a mixed set of
 //! implementors behind one `Box<dyn Trait>`. The [`macro@dyn_shim`] attribute
 //! reads the trait it is applied to, builds a second trait containing only the
-//! dyn-compatible subset, and forwards each call to the original.
+//! dyn-compatible subset, and forwards each call to the original. Every
+//! implementor of the source trait then works as a `dyn` shim.
 //!
-//! ```
-//! use dyn_shim::dyn_shim;
-//!
-//! #[dyn_shim(DynGreeter)]
-//! trait Greeter {
-//!     fn new() -> Self;          // receiverless: skipped, not dyn-compatible
-//!     fn greet(&self) -> String;
-//!     fn louder(&mut self);
-//! }
-//!
-//! struct Hi(String);
-//! impl Greeter for Hi {
-//!     fn new() -> Self { Hi("hi".into()) }
-//!     fn greet(&self) -> String { self.0.clone() }
-//!     fn louder(&mut self) { self.0 = self.0.to_uppercase(); }
-//! }
-//!
-//! let mut g: Box<dyn DynGreeter> = Box::new(Hi::new());
-//! g.louder();
-//! assert_eq!(g.greet(), "HI");
-//! ```
-//!
-//! See [`macro@dyn_shim`] for which methods are forwarded and the limitations.
+//! See [`macro@dyn_shim`] for a worked example, which methods are forwarded, and
+//! the limitations.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -40,51 +19,68 @@ use syn::{
     TraitItemFn, Type, parse_macro_input,
 };
 
-/// Attribute macro: generate a dyn-compatible shim for the annotated trait.
+/// Generate a dyn-compatible shim for the annotated trait.
 ///
 /// # Usage
 ///
-/// ```ignore
-/// #[dyn_shim(ShimName)]
-/// trait SourceTrait {
-///     // methods
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynFoo)]
+/// trait Foo {
+///     fn describe(&self) -> String;
+///
+///     fn make() -> Self;        // skipped: receiverless, not dyn-compatible
+///
+///     #[dyn_shim(skip)]
+///     fn debug_only(&self) {}   // skipped: opted out
 /// }
 /// ```
 ///
-/// The original trait is left in place. A new trait `ShimName` is generated
-/// alongside it, together with `impl<T: SourceTrait> ShimName for T`, so every
-/// implementor of `SourceTrait` is automatically a `ShimName` and can be used as
-/// `dyn ShimName`. `ShimName` inherits the source trait's visibility.
+/// The original trait is left in place. A new trait `DynFoo` is generated
+/// alongside it, together with `impl<T: Foo> DynFoo for T`, so every
+/// implementor of `Foo` is automatically a `DynFoo` and can be used as `dyn
+/// DynFoo`. `DynFoo` inherits the source trait's visibility.
 ///
-/// # Which methods are forwarded
+/// # Method Selection
 ///
-/// Each method is forwarded into the shim unless it cannot be dispatched through
-/// a trait object. A method is **skipped** when any of the following holds:
+/// A method is forwarded into the shim only if it can be dispatched through a
+/// trait object. The criteria below are a conservative per-method approximation
+/// of the language's [Dyn Compatibility] rules: they catch the common reasons a
+/// method is not callable on a `dyn` type, but do not reproduce the full rule
+/// set. A method is **skipped** when any of the following holds:
 ///
-/// - it has no `self` receiver (an associated function such as `fn new() -> Self`);
-/// - it is `async`;
-/// - it has a generic type or const parameter (lifetime parameters are fine);
-/// - its return type or any argument type mentions `Self`, or uses `impl Trait`;
-/// - it is annotated with `#[dyn_shim(skip)]`.
+/// - It has no `self` receiver (an associated function such as `fn new() -> Self`).
+/// - It is `async`.
+/// - It has a generic type or const parameter (lifetime parameters are fine).
+/// - Its return type or any argument type mentions `Self`, or uses `impl Trait`.
+/// - It requires `Self: Sized` (such a method is excluded from the vtable).
+/// - It is annotated with `#[dyn_shim(skip)]`.
 ///
 /// Skipped methods stay on the source trait and are reached on the concrete
 /// type. Forwarded methods keep their lifetimes and `where` clause. A by-value
 /// `self` receiver is rewritten to `self: Box<Self>` and forwarded by
-/// dereferencing the box; `&self`, `&mut self`, and explicit boxed/pinned
-/// receivers are forwarded unchanged.
+/// dereferencing the box. A dispatchable receiver (`&self`, `&mut self`, or an
+/// explicit `self: Box<Self>`, `Rc<Self>`, `Arc<Self>`, or `Pin<_>`) is
+/// forwarded unchanged.
 ///
 /// # Limitations
 ///
-/// - **The source trait may not be generic.** A trait with type, const, or
-///   lifetime parameters is rejected with a compile error.
-/// - **Method selection is conservative.** Any mention of `Self` in an argument
-///   or return type causes a method to be skipped, even shapes that would be
-///   dyn-compatible (for example a method bounded by `where Self: Sized`).
-/// - **Attributes and doc comments on methods are not copied** onto the shim.
+/// A skipped method (see [Method Selection](#method-selection)) is not a
+/// limitation of this macro: it cannot be dispatched through any trait object,
+/// so no shim could forward it. The limitations specific to this macro are:
 ///
-/// The generated shim is itself a trait used as `dyn`, so the forwarded methods
-/// must satisfy the language's dyn-compatibility rules. See [Dyn Compatibility]
-/// in the Rust Reference for the authoritative set.
+/// - **The source trait may not be generic.** A trait with type, const, or
+///   lifetime parameters is rejected with a compile error. Such a trait can
+///   still be dyn-compatible on its own (`dyn Trait<i32>`); the macro just does
+///   not generate a parameterized shim for it.
+/// - **Only a literal `where Self: Sized` bound is recognized.** Classifying any
+///   other `Self:` bound would need trait resolution, which is unavailable during
+///   macro expansion, so such a method is forwarded as written. This is correct
+///   for an auto-trait bound like `Self: Send` (call it through `&(dyn Shim +
+///   Send)`), but a `Self: Clone` bound produces a method that cannot be called
+///   on the shim's `dyn` type, and a `Self: Debug` bound produces a shim that
+///   does not compile. Annotate such a method with `#[dyn_shim(skip)]`.
 ///
 /// [Dyn Compatibility]: https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility
 ///
@@ -201,7 +197,7 @@ fn shim_doc(src: &Ident, skipped: &[(String, &str)]) -> Vec<String> {
     if !skipped.is_empty() {
         lines.push(String::new());
         lines.push("These methods of the source trait are not dyn-compatible, so they".to_string());
-        lines.push("are not part of this shim; call them on the concrete type:".to_string());
+        lines.push("are not part of this shim. Call them on the concrete type.".to_string());
         lines.push(String::new());
         for (name, reason) in skipped {
             lines.push(format!("- [`{src}::{name}`] ({reason})"));
@@ -222,6 +218,8 @@ fn skip_reason(method: &TraitItemFn) -> Option<&'static str> {
         Some("no self receiver")
     } else if has_type_or_const_generics(sig) {
         Some("generic type or const parameter")
+    } else if requires_self_sized(sig) {
+        Some("requires Self: Sized")
     } else if signature_mentions_self_or_impl_trait(sig) {
         Some("mentions Self or impl Trait")
     } else {
@@ -238,6 +236,29 @@ fn is_opted_out(method: &TraitItemFn) -> bool {
 /// by-value `self`, or a typed receiver such as `self: Box<Self>`).
 fn has_self_receiver(sig: &Signature) -> bool {
     matches!(sig.inputs.first(), Some(FnArg::Receiver(_)))
+}
+
+/// True if the method's `where` clause requires `Self: Sized`. Such a method is
+/// excluded from the vtable, so it cannot be dispatched through the shim's `dyn`
+/// type even though its signature is otherwise compatible.
+fn requires_self_sized(sig: &Signature) -> bool {
+    let Some(where_clause) = &sig.generics.where_clause else {
+        return false;
+    };
+    where_clause.predicates.iter().any(|pred| {
+        let syn::WherePredicate::Type(pred) = pred else {
+            return false;
+        };
+        let Type::Path(bounded) = &pred.bounded_ty else {
+            return false;
+        };
+        if bounded.qself.is_some() || !bounded.path.is_ident("Self") {
+            return false;
+        }
+        pred.bounds
+            .iter()
+            .any(|bound| matches!(bound, syn::TypeParamBound::Trait(t) if t.path.is_ident("Sized")))
+    })
 }
 
 /// True if the method declares a generic type or const parameter. Lifetime
