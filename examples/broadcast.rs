@@ -1,4 +1,4 @@
-//! Broadcasting a message to a heterogeneous set of notification channels.
+//! Broadcasting a message to a mixed set of notification channels.
 //!
 //! `Channel` is not dyn-compatible. It has a by-value `close(self)` shutdown
 //! method and a receiverless `connect() -> Self` constructor, so you cannot keep
@@ -81,7 +81,7 @@ impl Channel for Webhook {
 }
 
 fn main() {
-    // A mixed fleet of channels behind one erased type.
+    // Different channel types behind one boxed trait object.
     let mut channels: Vec<Box<dyn DynChannel>> =
         vec![Box::new(Email::connect()), Box::new(Webhook::connect())];
 

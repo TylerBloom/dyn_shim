@@ -141,7 +141,7 @@ fn lifetime_no_where() {
 }
 
 #[test]
-fn heterogeneous_existential() {
+fn mixed_box_collection() {
     let mut zoo: Vec<Box<dyn DynTrait>> = vec![Box::new(Foo(100)), Box::new(Bar("hi".into()))];
     for item in zoo.iter_mut() {
         item.bump(1);

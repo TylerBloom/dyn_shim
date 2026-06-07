@@ -7,8 +7,8 @@
 //! dyn-compatible subset, and forwards each call to the original. Every
 //! implementor of the source trait then works as a `dyn` shim.
 //!
-//! See [`macro@dyn_shim`] for a worked example, which methods are forwarded, and
-//! the limitations.
+//! See [`macro@dyn_shim`] for an example, which methods are forwarded, and the
+//! limitations.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -45,10 +45,10 @@ use syn::{
 /// # Method Selection
 ///
 /// A method is forwarded into the shim only if it can be dispatched through a
-/// trait object. The criteria below are a conservative per-method approximation
-/// of the language's [Dyn Compatibility] rules: they catch the common reasons a
-/// method is not callable on a `dyn` type, but do not reproduce the full rule
-/// set. A method is **skipped** when any of the following holds:
+/// trait object. The criteria below approximate the language's [Dyn
+/// Compatibility] rules per method. They catch the common reasons a method is
+/// not callable on a `dyn` type, but do not reproduce the full rule set. A
+/// method is **skipped** when any of the following holds:
 ///
 /// - It has no `self` receiver (an associated function such as `fn new() -> Self`).
 /// - It is `async`.
@@ -135,7 +135,7 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
         let TraitItem::Fn(method) = item else {
             continue;
         };
-        match skip_reason(method) {
+        match skip(method) {
             Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
             None => {
                 let (sig, body) = forward(method, src);
@@ -145,8 +145,8 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Re-emit the source trait without our `#[dyn_shim(skip)]` helper attributes,
-    // and point its docs at the generated shim.
+    // Re-emit the source trait without our `#[dyn_shim(skip)]` helper
+    // attributes, and point its docs at the generated shim.
     let mut clean = input.clone();
     for item in &mut clean.items {
         if let TraitItem::Fn(method) = item {
@@ -174,112 +174,6 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
     .into()
-}
-
-/// Build the doc-comment lines appended to the source trait, pointing readers at
-/// the generated dyn-compatible shim.
-fn source_doc(shim_name: &Ident) -> Vec<String> {
-    vec![
-        String::new(),
-        "# Dyn Compatibility".to_string(),
-        String::new(),
-        format!(
-            "[`{shim_name}`] is a generated dyn-compatible shim for this trait. \
-             Use `dyn {shim_name}` to hold implementors behind a trait object."
-        ),
-    ]
-}
-
-/// Build the doc-comment lines for the generated shim trait, listing any source
-/// methods that were skipped and why.
-fn shim_doc(src: &Ident, skipped: &[(String, &str)]) -> Vec<String> {
-    let mut lines = vec![format!("Dyn-compatible shim for [`{src}`].")];
-    if !skipped.is_empty() {
-        lines.push(String::new());
-        lines.push("These methods of the source trait are not dyn-compatible, so they".to_string());
-        lines.push("are not part of this shim. Call them on the concrete type.".to_string());
-        lines.push(String::new());
-        for (name, reason) in skipped {
-            lines.push(format!("- [`{src}::{name}`] ({reason})"));
-        }
-    }
-    lines
-}
-
-/// If a method cannot be dispatched through a trait object, return a short
-/// reason it is skipped. Return `None` when the method is forwarded.
-fn skip_reason(method: &TraitItemFn) -> Option<&'static str> {
-    let sig = &method.sig;
-    if is_opted_out(method) {
-        Some("opted out with #[dyn_shim(skip)]")
-    } else if sig.asyncness.is_some() {
-        Some("async fn")
-    } else if !has_self_receiver(sig) {
-        Some("no self receiver")
-    } else if has_type_or_const_generics(sig) {
-        Some("generic type or const parameter")
-    } else if requires_self_sized(sig) {
-        Some("requires Self: Sized")
-    } else if signature_mentions_self_or_impl_trait(sig) {
-        Some("mentions Self or impl Trait")
-    } else {
-        None
-    }
-}
-
-/// True for a method annotated with `#[dyn_shim(skip)]`.
-fn is_opted_out(method: &TraitItemFn) -> bool {
-    method.attrs.iter().any(is_skip_attr)
-}
-
-/// True if the first parameter is a `self` receiver (`&self`, `&mut self`,
-/// by-value `self`, or a typed receiver such as `self: Box<Self>`).
-fn has_self_receiver(sig: &Signature) -> bool {
-    matches!(sig.inputs.first(), Some(FnArg::Receiver(_)))
-}
-
-/// True if the method's `where` clause requires `Self: Sized`. Such a method is
-/// excluded from the vtable, so it cannot be dispatched through the shim's `dyn`
-/// type even though its signature is otherwise compatible.
-fn requires_self_sized(sig: &Signature) -> bool {
-    let Some(where_clause) = &sig.generics.where_clause else {
-        return false;
-    };
-    where_clause.predicates.iter().any(|pred| {
-        let syn::WherePredicate::Type(pred) = pred else {
-            return false;
-        };
-        let Type::Path(bounded) = &pred.bounded_ty else {
-            return false;
-        };
-        if bounded.qself.is_some() || !bounded.path.is_ident("Self") {
-            return false;
-        }
-        pred.bounds
-            .iter()
-            .any(|bound| matches!(bound, syn::TypeParamBound::Trait(t) if t.path.is_ident("Sized")))
-    })
-}
-
-/// True if the method declares a generic type or const parameter. Lifetime
-/// parameters do not count, since they are forwarded as-is.
-fn has_type_or_const_generics(sig: &Signature) -> bool {
-    sig.generics
-        .params
-        .iter()
-        .any(|p| !matches!(p, GenericParam::Lifetime(_)))
-}
-
-/// True if the return type or any argument type mentions `Self` or `impl Trait`.
-fn signature_mentions_self_or_impl_trait(sig: &Signature) -> bool {
-    let return_bad =
-        matches!(&sig.output, ReturnType::Type(_, ty) if mentions_self_or_impl_trait(ty));
-    let arg_bad = sig
-        .inputs
-        .iter()
-        .skip(1)
-        .any(|arg| matches!(arg, FnArg::Typed(pat) if mentions_self_or_impl_trait(&pat.ty)));
-    return_bad || arg_bad
 }
 
 /// Build the shim signature and the forwarding impl body for one method.
@@ -318,6 +212,115 @@ fn forward(method: &TraitItemFn, src: &Ident) -> (TokenStream2, TokenStream2) {
         }
     };
     (shim_sig, shim_impl)
+}
+
+/// Build the doc-comment lines appended to the source trait, pointing readers
+/// at the generated dyn-compatible shim.
+fn source_doc(shim_name: &Ident) -> Vec<String> {
+    vec![
+        String::new(),
+        "# Dyn Compatibility".to_string(),
+        String::new(),
+        format!(
+            "[`{shim_name}`] is a generated dyn-compatible shim for this trait. \
+             Use `dyn {shim_name}` to hold implementors behind a trait object."
+        ),
+    ]
+}
+
+/// Build the doc-comment lines for the generated shim trait, listing any source
+/// methods that were skipped and why.
+fn shim_doc(src: &Ident, skipped: &[(String, &str)]) -> Vec<String> {
+    let mut lines = vec![format!("Dyn-compatible shim for [`{src}`].")];
+    if !skipped.is_empty() {
+        lines.push(String::new());
+        lines.push("These methods of the source trait are not dyn-compatible, so they".to_string());
+        lines.push("are not part of this shim. Call them on the concrete type.".to_string());
+        lines.push(String::new());
+        for (name, reason) in skipped {
+            lines.push(format!("- [`{src}::{name}`] ({reason})"));
+        }
+    }
+    lines
+}
+
+/// If a method cannot be dispatched through a trait object, return a short
+/// reason it is skipped. Return `None` when the method is forwarded.
+fn skip(method: &TraitItemFn) -> Option<&'static str> {
+    let sig = &method.sig;
+    if is_opted_out(method) {
+        Some("opted out with #[dyn_shim(skip)]")
+    } else if sig.asyncness.is_some() {
+        Some("async fn")
+    } else if !has_self_receiver(sig) {
+        Some("no self receiver")
+    } else if has_type_or_const_generics(sig) {
+        Some("generic type or const parameter")
+    } else if requires_self_sized(sig) {
+        Some("requires Self: Sized")
+    } else if signature_mentions_self_or_impl_trait(sig) {
+        Some("mentions Self or impl Trait")
+    } else {
+        None
+    }
+}
+
+/// True for a method annotated with `#[dyn_shim(skip)]`.
+fn is_opted_out(method: &TraitItemFn) -> bool {
+    method.attrs.iter().any(is_skip_attr)
+}
+
+/// True if the first parameter is a `self` receiver (`&self`, `&mut self`,
+/// by-value `self`, or a typed receiver such as `self: Box<Self>`).
+fn has_self_receiver(sig: &Signature) -> bool {
+    matches!(sig.inputs.first(), Some(FnArg::Receiver(_)))
+}
+
+/// True if the method's `where` clause requires `Self: Sized`. Such a method is
+/// excluded from the vtable, so it cannot be dispatched through the shim's
+/// `dyn` type even though its signature is otherwise compatible.
+fn requires_self_sized(sig: &Signature) -> bool {
+    let Some(where_clause) = &sig.generics.where_clause else {
+        return false;
+    };
+    where_clause.predicates.iter().any(|pred| {
+        let syn::WherePredicate::Type(pred) = pred else {
+            return false;
+        };
+        let Type::Path(bounded) = &pred.bounded_ty else {
+            return false;
+        };
+        if bounded.qself.is_some() || !bounded.path.is_ident("Self") {
+            return false;
+        }
+        pred.bounds
+            .iter()
+            .any(|bound| matches!(bound, syn::TypeParamBound::Trait(t) if t.path.is_ident("Sized")))
+    })
+}
+
+/// True if the method declares a generic type or const parameter. Lifetime
+/// parameters do not count, since they are forwarded as-is.
+fn has_type_or_const_generics(sig: &Signature) -> bool {
+    sig.generics
+        .params
+        .iter()
+        .any(|p| !matches!(p, GenericParam::Lifetime(_)))
+}
+
+/// True if the return type or any argument type mentions `Self` or `impl
+/// Trait`.
+fn signature_mentions_self_or_impl_trait(sig: &Signature) -> bool {
+    let return_bad =
+        matches!(&sig.output, ReturnType::Type(_, ty) if mentions_self_or_impl_trait(ty));
+
+    let arg_bad = sig
+        .inputs
+        .iter()
+        .skip(1)
+        .any(|arg| matches!(arg, FnArg::Typed(pat) if mentions_self_or_impl_trait(&pat.ty)));
+
+    return_bad || arg_bad
 }
 
 /// True for `#[dyn_shim(skip)]`.
