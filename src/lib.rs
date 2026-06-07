@@ -83,10 +83,10 @@ use syn::{
 /// - **Attributes and doc comments on methods are not copied** onto the shim.
 ///
 /// The generated shim is itself a trait used as `dyn`, so the forwarded methods
-/// must satisfy the language's dyn-compatibility rules. See [dyn compatibility]
+/// must satisfy the language's dyn-compatibility rules. See [Dyn Compatibility]
 /// in the Rust Reference for the authoritative set.
 ///
-/// [dyn compatibility]: https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility
+/// [Dyn Compatibility]: https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility
 ///
 /// # Example
 ///
@@ -149,12 +149,16 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Re-emit the source trait without our `#[dyn_shim(skip)]` helper attributes.
+    // Re-emit the source trait without our `#[dyn_shim(skip)]` helper attributes,
+    // and point its docs at the generated shim.
     let mut clean = input.clone();
     for item in &mut clean.items {
         if let TraitItem::Fn(method) = item {
             method.attrs.retain(|a| !a.path().is_ident("dyn_shim"));
         }
+    }
+    for line in source_doc(&shim_name) {
+        clean.attrs.push(syn::parse_quote! { #[doc = #line] });
     }
 
     let doc_attrs = shim_doc(src, &skipped)
@@ -176,6 +180,20 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Build the doc-comment lines appended to the source trait, pointing readers at
+/// the generated dyn-compatible shim.
+fn source_doc(shim_name: &Ident) -> Vec<String> {
+    vec![
+        String::new(),
+        "# Dyn Compatibility".to_string(),
+        String::new(),
+        format!(
+            "[`{shim_name}`] is a generated dyn-compatible shim for this trait. \
+             Use `dyn {shim_name}` to hold implementors behind a trait object."
+        ),
+    ]
+}
+
 /// Build the doc-comment lines for the generated shim trait, listing any source
 /// methods that were skipped and why.
 fn shim_doc(src: &Ident, skipped: &[(String, &str)]) -> Vec<String> {
@@ -186,7 +204,7 @@ fn shim_doc(src: &Ident, skipped: &[(String, &str)]) -> Vec<String> {
         lines.push("are not part of this shim; call them on the concrete type:".to_string());
         lines.push(String::new());
         for (name, reason) in skipped {
-            lines.push(format!("- `{name}` ({reason})"));
+            lines.push(format!("- [`{src}::{name}`] ({reason})"));
         }
     }
     lines
