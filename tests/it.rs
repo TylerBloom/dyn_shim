@@ -1,3 +1,7 @@
+// Several methods declare lifetimes that could be elided; they are explicit on
+// purpose, to exercise lifetime forwarding.
+#![allow(clippy::needless_lifetimes)]
+
 use dyn_shim::dyn_shim;
 use std::fmt::Display;
 use std::pin::Pin;
@@ -252,4 +256,43 @@ impl HasAssoc for Assoc {
 fn assoc_items_trait_shimmed() {
     let d: &dyn DynAssoc = &Assoc;
     assert_eq!(d.label(), "Assoc");
+}
+
+// A forwarded method keeps its whole signature and its attributes. `unsafe`
+// and an explicit ABI are carried onto the shim, and a `#[cfg]`-gated method
+// is gated identically on the source trait, the shim trait, and the blanket
+// impl: `sometimes` is compiled out everywhere here, so its missing impl (and
+// nonexistent argument type) must not break the build.
+#[allow(dead_code)]
+#[dyn_shim(DynSig)]
+trait SigPreserving {
+    /// Doc carried onto the shim.
+    #[must_use]
+    fn answer(&self) -> i32;
+    unsafe fn raw(&self) -> i32;
+    extern "C" fn c_abi(&self) -> i32;
+    #[cfg(any())]
+    fn sometimes(&self, arg: NoSuchType) -> NoSuchType;
+}
+
+struct Sig(i32);
+impl SigPreserving for Sig {
+    fn answer(&self) -> i32 {
+        self.0
+    }
+    unsafe fn raw(&self) -> i32 {
+        -self.0
+    }
+    extern "C" fn c_abi(&self) -> i32 {
+        self.0 * 2
+    }
+}
+
+#[test]
+fn signature_and_attrs_preserved() {
+    let d: Box<dyn DynSig> = Box::new(Sig(7));
+    assert_eq!(d.answer(), 7);
+    // The shim method is `unsafe fn`, so it must be called in an unsafe block.
+    assert_eq!(unsafe { d.raw() }, -7);
+    assert_eq!(d.c_abi(), 14);
 }

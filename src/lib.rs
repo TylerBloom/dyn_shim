@@ -15,7 +15,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, FnArg, GenericParam, Ident, ItemTrait, ReturnType, Signature, TraitItem,
+    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, ReturnType, Signature, TraitItem,
     TraitItemFn, Type, parse_macro_input,
 };
 
@@ -58,7 +58,10 @@ use syn::{
 /// - It is annotated with `#[dyn_shim(skip)]`.
 ///
 /// Skipped methods stay on the source trait and are reached on the concrete
-/// type. Forwarded methods keep their lifetimes and `where` clause. A by-value
+/// type. A forwarded method keeps its entire signature — lifetimes, `where`
+/// clause, parameter names, `unsafe`, and any explicit ABI — as well as its
+/// attributes, so `#[doc]`, `#[must_use]`, `#[deprecated]`, and `#[cfg]`
+/// behave the same on the shim as on the source trait. A by-value
 /// `self` receiver is rewritten to `self: Box<Self>` and forwarded by
 /// dereferencing the box. A dispatchable receiver (`&self`, `&mut self`, or an
 /// explicit `self: Box<Self>`, `Rc<Self>`, `Arc<Self>`, or `Pin<_>`) is
@@ -177,37 +180,67 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Build the shim signature and the forwarding impl body for one method.
+///
+/// The shim method reuses the source method's entire signature (`unsafe`, ABI,
+/// generics, `where` clause, ...) and its attributes, rewriting only the
+/// inputs: a by-value `self` becomes `self: Box<Self>`, and each argument
+/// keeps its declared name where it has one. Copying the attributes keeps
+/// `#[doc]`, `#[must_use]`, and `#[deprecated]` working on the shim, and keeps
+/// a `#[cfg]`-gated method gated consistently across the source trait, the
+/// shim trait, and the blanket impl.
 fn forward(method: &TraitItemFn, src: &Ident) -> (TokenStream2, TokenStream2) {
-    let sig = &method.sig;
-    let name = &sig.ident;
-    let (generics, _, where_clause) = sig.generics.split_for_impl();
-    let output = &sig.output;
+    let mut sig = method.sig.clone();
 
-    let FnArg::Receiver(recv) = sig.inputs.first().unwrap() else {
-        unreachable!("should_forward guarantees a receiver")
+    let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
+        unreachable!("skip guarantees a receiver")
     };
     let by_value = recv.reference.is_none() && recv.colon_token.is_none();
-    let (receiver, self_expr) = if by_value {
-        (quote! { self: Box<Self> }, quote! { *self })
+    let self_expr = if by_value {
+        sig.inputs[0] = syn::parse_quote! { self: Box<Self> };
+        quote! { *self }
     } else {
-        (quote! { #recv }, quote! { self })
+        quote! { self }
     };
 
-    let mut decls = Vec::new();
     let mut names = Vec::new();
-    for (i, arg) in sig.inputs.iter().skip(1).enumerate() {
+    for (i, arg) in sig.inputs.iter_mut().skip(1).enumerate() {
         let FnArg::Typed(pat) = arg else { continue };
-        let ty = &pat.ty;
-        let id = format_ident!("__a{i}");
-        decls.push(quote! { #id: #ty });
+        // Keep the declared name; a non-trivial pattern (only legal on a
+        // defaulted method) gets a synthetic name the impl can forward.
+        let id = match &*pat.pat {
+            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
+            _ => format_ident!("__a{i}"),
+        };
+        *pat.pat = syn::parse_quote! { #id };
         names.push(id);
     }
 
+    let attrs: Vec<&Attribute> = method
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("dyn_shim"))
+        .collect();
+    // The impl method only takes the `cfg` gates: attributes like `#[must_use]`
+    // and `#[deprecated]` are rejected on trait methods in impl blocks (which
+    // also rules out forwarding `cfg_attr`, since it can expand to them), but a
+    // `#[cfg]`-gated method must stay gated everywhere it is emitted.
+    // `#[allow]` keeps the generated forwarding call to a `#[deprecated]`
+    // method from warning.
+    let cfg_attrs: Vec<&Attribute> = attrs
+        .iter()
+        .copied()
+        .filter(|a| a.path().is_ident("cfg"))
+        .collect();
+
+    let name = &sig.ident;
     let shim_sig = quote! {
-        fn #name #generics (#receiver #(, #decls)*) #output #where_clause ;
+        #(#attrs)*
+        #sig ;
     };
     let shim_impl = quote! {
-        fn #name #generics (#receiver #(, #decls)*) #output #where_clause {
+        #(#cfg_attrs)*
+        #[allow(deprecated)]
+        #sig {
             <__T as #src>::#name(#self_expr #(, #names)*)
         }
     };
