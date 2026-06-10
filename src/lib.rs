@@ -194,7 +194,12 @@ fn forward(method: &TraitItemFn, src: &Ident) -> (TokenStream2, TokenStream2) {
     let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
         unreachable!("skip guarantees a receiver")
     };
-    let by_value = recv.reference.is_none() && recv.colon_token.is_none();
+    // `self: Self` is the explicit spelling of by-value `self`; only a typed
+    // receiver with a real wrapper type (Box, Rc, Arc, Pin, ...) is forwarded
+    // unchanged.
+    let by_value = recv.reference.is_none()
+        && (recv.colon_token.is_none()
+            || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self")));
     let self_expr = if by_value {
         // Absolute path: the expansion must not depend on what `Box` names at
         // the call site (a local shadow, or a missing prelude under no_std).

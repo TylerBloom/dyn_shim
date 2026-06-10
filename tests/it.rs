@@ -159,7 +159,9 @@ fn mixed_box_collection() {
 
 // Every dispatchable receiver type is forwarded into the shim: `&self`,
 // `&mut self`, and the explicit smart-pointer receivers `Box<Self>`,
-// `Rc<Self>`, `Arc<Self>`, and `Pin<&mut Self>`.
+// `Rc<Self>`, `Arc<Self>`, and `Pin<&mut Self>`. An explicit `self: Self`
+// is the typed spelling of by-value `self` and is rewritten to
+// `self: Box<Self>` just like the shorthand.
 #[dyn_shim(DynRecv)]
 trait Receivers {
     fn by_ref(&self) -> i32;
@@ -168,6 +170,7 @@ trait Receivers {
     fn by_rc(self: Rc<Self>) -> i32;
     fn by_arc(self: Arc<Self>) -> i32;
     fn by_pin(self: Pin<&mut Self>) -> i32;
+    fn by_self(self: Self) -> i32;
 }
 
 struct Recv(i32);
@@ -190,6 +193,9 @@ impl Receivers for Recv {
     }
     fn by_pin(self: Pin<&mut Self>) -> i32 {
         self.0 + 40
+    }
+    fn by_self(self) -> i32 {
+        self.0 + 50
     }
 }
 
@@ -225,6 +231,12 @@ fn arc_receiver() {
 fn pin_receiver() {
     let mut pinned: Pin<Box<dyn DynRecv>> = Box::pin(Recv(1));
     assert_eq!(pinned.as_mut().by_pin(), 41);
+}
+
+#[test]
+fn explicit_self_receiver() {
+    let b: Box<dyn DynRecv> = Box::new(Recv(1));
+    assert_eq!(b.by_self(), 51);
 }
 
 // A source trait that is itself not dyn-compatible (it carries an associated
