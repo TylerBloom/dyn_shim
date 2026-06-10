@@ -1,8 +1,8 @@
-error[E0599]: no associated function or constant named `answer` found for trait `dyn Dyn`
+error[E0599]: no function or associated item named `answer` found for trait `dyn Dyn`
   --> tests/ui/skip_receiverless.rs:21:24
    |
 21 |     let _ = <dyn Dyn>::answer();
-   |                        ^^^^^^ associated function or constant not found in `dyn Dyn`
+   |                        ^^^^^^ function or associated item not found in `dyn Dyn`
    |
 note: `Src` defines an item `answer`
   --> tests/ui/skip_receiverless.rs:4:1
