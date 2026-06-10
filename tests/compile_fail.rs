@@ -16,3 +16,14 @@ fn skipped_methods_absent_from_shim() {
     t.compile_fail("tests/ui/skip_self_sized.rs");
     t.compile_fail("tests/ui/skip_attr.rs");
 }
+
+// An invalid `#[dyn_shim(...)]` helper attribute is rejected with a direct
+// error: on a non-method trait item the attribute is unsupported entirely, and
+// on a method the only recognized argument is `skip`. Both errors come from
+// the macro itself, not rustc, so the snapshots are stable across toolchains.
+#[test]
+fn invalid_helper_attrs_rejected() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/attr_non_method.rs");
+    t.compile_fail("tests/ui/attr_unknown_arg.rs");
+}

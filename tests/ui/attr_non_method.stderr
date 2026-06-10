@@ -1,0 +1,5 @@
+error: #[dyn_shim] attributes are only supported on methods
+ --> tests/ui/attr_non_method.rs:7:5
+  |
+7 |     #[dyn_shim(skip)]
+  |     ^^^^^^^^^^^^^^^^^

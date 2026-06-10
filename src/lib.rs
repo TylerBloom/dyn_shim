@@ -128,6 +128,36 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into();
     }
 
+    // Validate the `#[dyn_shim(...)]` helper attributes: on a method the only
+    // supported argument is `skip`; on any other trait item the attribute is
+    // rejected outright. Only methods are stripped of it before the trait is
+    // re-emitted, so left in place rustc would re-expand it as this attribute
+    // macro and fail with an unrelated parse error pointing at the item.
+    for item in &input.items {
+        let attrs = match item {
+            TraitItem::Fn(item) => {
+                for attr in item.attrs.iter().filter(|a| a.path().is_ident("dyn_shim")) {
+                    if let Err(err) = require_skip(attr) {
+                        return err.to_compile_error().into();
+                    }
+                }
+                continue;
+            }
+            TraitItem::Const(item) => &item.attrs,
+            TraitItem::Type(item) => &item.attrs,
+            TraitItem::Macro(item) => &item.attrs,
+            _ => continue,
+        };
+        if let Some(attr) = attrs.iter().find(|a| a.path().is_ident("dyn_shim")) {
+            return syn::Error::new_spanned(
+                attr,
+                "#[dyn_shim] attributes are only supported on methods",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+
     let src = &input.ident;
     let vis = &input.vis;
 
@@ -305,9 +335,29 @@ fn skip(method: &TraitItemFn) -> Option<&'static str> {
     }
 }
 
-/// True for a method annotated with `#[dyn_shim(skip)]`.
+/// Require a method's `#[dyn_shim(...)]` attribute to be exactly
+/// `#[dyn_shim(skip)]`, the only supported helper argument.
+fn require_skip(attr: &Attribute) -> syn::Result<()> {
+    let mut skip = false;
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("skip") {
+            skip = true;
+            Ok(())
+        } else {
+            Err(meta.error("unsupported dyn_shim argument, expected `skip`"))
+        }
+    })?;
+    if skip {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(attr, "expected #[dyn_shim(skip)]"))
+    }
+}
+
+/// True for a method annotated with `#[dyn_shim(skip)]`. The attribute's
+/// arguments were validated up front, so its presence alone means skip.
 fn is_opted_out(method: &TraitItemFn) -> bool {
-    method.attrs.iter().any(is_skip_attr)
+    method.attrs.iter().any(|a| a.path().is_ident("dyn_shim"))
 }
 
 /// True if the first parameter is a `self` receiver (`&self`, `&mut self`,
@@ -361,21 +411,6 @@ fn signature_mentions_self_or_impl_trait(sig: &Signature) -> bool {
         .any(|arg| matches!(arg, FnArg::Typed(pat) if mentions_self_or_impl_trait(&pat.ty)));
 
     return_bad || arg_bad
-}
-
-/// True for `#[dyn_shim(skip)]`.
-fn is_skip_attr(attr: &Attribute) -> bool {
-    if !attr.path().is_ident("dyn_shim") {
-        return false;
-    }
-    let mut skip = false;
-    let _ = attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("skip") {
-            skip = true;
-        }
-        Ok(())
-    });
-    skip
 }
 
 /// True if a type mentions `Self` or uses `impl Trait`, either of which makes a
