@@ -196,7 +196,9 @@ fn forward(method: &TraitItemFn, src: &Ident) -> (TokenStream2, TokenStream2) {
     };
     let by_value = recv.reference.is_none() && recv.colon_token.is_none();
     let self_expr = if by_value {
-        sig.inputs[0] = syn::parse_quote! { self: Box<Self> };
+        // Absolute path: the expansion must not depend on what `Box` names at
+        // the call site (a local shadow, or a missing prelude under no_std).
+        sig.inputs[0] = syn::parse_quote! { self: ::std::boxed::Box<Self> };
         quote! { *self }
     } else {
         quote! { self }
