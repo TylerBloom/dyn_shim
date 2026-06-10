@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/dyn_shim.svg)](https://crates.io/crates/dyn_shim)
 [![docs.rs](https://img.shields.io/docsrs/dyn_shim)](https://docs.rs/dyn_shim)
-[![CI](https://github.com/nixpulvis/dyn_shim/actions/workflows/ci.yml/badge.svg)](https://github.com/nixpulvis/dyn_shim/actions/workflows/ci.yml)
+[![CI](https://github.com/nixpulvis/dyn_shim/actions/workflows/rust.yml/badge.svg)](https://github.com/nixpulvis/dyn_shim/actions/workflows/rust.yml)
 [![license](https://img.shields.io/crates/l/dyn_shim.svg)](LICENSE)
 
 Generate a dyn-compatible shim trait and blanket impl from a source trait that
@@ -33,6 +33,7 @@ use dyn_shim::dyn_shim;
 trait Sink {
     // ...
 }
+```
 
 See the [API documentation](https://docs.rs/dyn_shim) for details.
 
