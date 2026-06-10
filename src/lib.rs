@@ -17,8 +17,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, ReturnType, Signature, Token,
-    TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
+    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, ReturnType, Signature, Token, TraitItem,
+    TraitItemFn, Type, TypeParamBound, parse_macro_input,
 };
 
 /// Arguments to [`macro@dyn_shim`]: the shim trait's name, optionally followed
