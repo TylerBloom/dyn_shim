@@ -13,11 +13,33 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, ReturnType, Signature, TraitItem,
-    TraitItemFn, Type, parse_macro_input,
+    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, ReturnType, Signature, Token,
+    TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
 };
+
+/// Arguments to [`macro@dyn_shim`]: the shim trait's name, optionally followed
+/// by supertraits to put on it, written like a trait's supertrait list
+/// (`DynFoo: Send + Sync`).
+struct Args {
+    shim_name: Ident,
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+}
+
+impl Parse for Args {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let shim_name = input.parse()?;
+        let mut bounds = Punctuated::new();
+        if input.peek(Token![:]) {
+            input.parse::<Token![:]>()?;
+            bounds = Punctuated::parse_separated_nonempty(input)?;
+        }
+        Ok(Args { shim_name, bounds })
+    }
+}
 
 /// Generate a dyn-compatible shim for the annotated trait.
 ///
@@ -67,6 +89,42 @@ use syn::{
 /// explicit `self: Box<Self>`, `Rc<Self>`, `Arc<Self>`, or `Pin<_>`) is
 /// forwarded unchanged.
 ///
+/// # Bounds
+///
+/// The generated shim has no supertraits by default — not even the source
+/// trait's. Optional bounds after the shim's name, written like a trait's
+/// supertrait list, are added as supertraits of the shim and as bounds on the
+/// blanket impl:
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynJob: Send + Sync)]
+/// trait Job {
+///     fn run(&self) -> u32;
+/// }
+///
+/// struct Sleep;
+/// impl Job for Sleep {
+///     fn run(&self) -> u32 { 1 }
+/// }
+///
+/// let job: Box<dyn DynJob> = Box::new(Sleep);
+/// assert_eq!(std::thread::spawn(move || job.run()).join().unwrap(), 1);
+/// ```
+///
+/// This is also the way to re-add a supertrait of the source trait, making its
+/// methods callable on the shim's `dyn` type (`DynShim: std::fmt::Display`,
+/// for example).
+///
+/// **The macro cannot check the listed bounds.** Trait resolution is
+/// unavailable during macro expansion, so it is up to you to name only bounds
+/// that `dyn` allows: auto traits such as `Send` and `Sync`, lifetimes such as
+/// `'static`, and dyn-compatible traits are all fine, but naming a
+/// non-dyn-compatible trait makes the generated shim non-dyn-compatible too.
+/// An implementor of the source trait that does not satisfy the bounds does
+/// not receive the shim impl.
+///
 /// # Limitations
 ///
 /// A skipped method (see [Method Selection](#method-selection)) is not a
@@ -77,6 +135,11 @@ use syn::{
 ///   lifetime parameters is rejected with a compile error. Such a trait can
 ///   still be dyn-compatible on its own (`dyn Trait<i32>`); the macro just does
 ///   not generate a parameterized shim for it.
+/// - **Supertraits are not inherited.** The macro cannot tell whether a
+///   supertrait is dyn-compatible, so it carries none of them onto the shim and
+///   their methods are not callable on the shim's `dyn` type. Re-add the ones
+///   you need — and know to be dyn-compatible — as [bounds on the shim's
+///   name](#bounds).
 /// - **Only a literal `where Self: Sized` bound is recognized.** Classifying any
 ///   other `Self:` bound would need trait resolution, which is unavailable during
 ///   macro expansion, so such a method is forwarded as written. This is correct
@@ -119,7 +182,7 @@ use syn::{
 /// ```
 #[proc_macro_attribute]
 pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let shim_name = parse_macro_input!(attr as Ident);
+    let Args { shim_name, bounds } = parse_macro_input!(attr as Args);
     let input = parse_macro_input!(item as ItemTrait);
 
     if let Some(param) = input.generics.params.first() {
@@ -194,15 +257,20 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into_iter()
         .map(|line| quote! { #[doc = #line] });
 
+    // The user-supplied bounds become the shim's supertraits, so the blanket
+    // impl must require them of the implementor as well.
+    let supertraits = (!bounds.is_empty()).then(|| quote! { : #bounds });
+    let impl_bounds = (!bounds.is_empty()).then(|| quote! { + #bounds });
+
     quote! {
         #clean
 
         #(#doc_attrs)*
-        #vis trait #shim_name {
+        #vis trait #shim_name #supertraits {
             #(#sigs)*
         }
 
-        impl<__T: #src> #shim_name for __T {
+        impl<__T: #src #impl_bounds> #shim_name for __T {
             #(#impls)*
         }
     }

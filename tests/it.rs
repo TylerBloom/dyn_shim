@@ -270,6 +270,33 @@ fn assoc_items_trait_shimmed() {
     assert_eq!(d.label(), "Assoc");
 }
 
+// Bounds on the shim's name become its supertraits (and bounds on the blanket
+// impl): an auto trait lets the trait object cross threads, and a re-added
+// dyn-compatible supertrait is callable on the `dyn` type.
+#[dyn_shim(DynTask: Send + Display)]
+trait Task: Display {
+    fn id(&self) -> i32;
+}
+
+struct Job(i32);
+impl std::fmt::Display for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "job#{}", self.0)
+    }
+}
+impl Task for Job {
+    fn id(&self) -> i32 {
+        self.0
+    }
+}
+
+#[test]
+fn bounds_on_shim() {
+    let t: Box<dyn DynTask> = Box::new(Job(4));
+    assert_eq!(format!("{t}"), "job#4");
+    assert_eq!(std::thread::spawn(move || t.id()).join().unwrap(), 4);
+}
+
 // A forwarded method keeps its whole signature and its attributes. `unsafe`
 // and an explicit ABI are carried onto the shim, and a `#[cfg]`-gated method
 // is gated identically on the source trait, the shim trait, and the blanket
