@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so the trybuild snapshots in tests/ui match the compiler everywhere:
+# the rustc-emitted errors in them change wording across releases. Bumping
+# this may require re-blessing the snapshots (TRYBUILD=overwrite cargo test).
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
