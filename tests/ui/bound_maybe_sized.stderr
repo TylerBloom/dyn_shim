@@ -1,0 +1,7 @@
+error: relaxed bounds are not permitted in supertrait bounds
+ --> tests/ui/bound_maybe_sized.rs:6:17
+  |
+6 | #[dyn_shim(Dyn: ?Sized)]
+  |                 ^^^^^^
+  |
+  = note: traits are not implicitly bounded by `Sized`, so there is nothing to relax

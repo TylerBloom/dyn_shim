@@ -1,0 +1,5 @@
+error: `Default` has no `self` receiver and cannot be dispatched through a trait object (construct values as concrete types and box them)
+ --> tests/ui/bound_default.rs:4:17
+  |
+4 | #[dyn_shim(Dyn: Default)]
+  |                 ^^^^^^^

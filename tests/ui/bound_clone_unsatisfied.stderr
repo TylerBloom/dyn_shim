@@ -1,0 +1,18 @@
+error[E0277]: the trait bound `NotClone: Dyn` is not satisfied
+  --> tests/ui/bound_clone_unsatisfied.rs:19:27
+   |
+19 |     let b: Box<dyn Dyn> = Box::new(NotClone);
+   |                           ^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `NotClone`
+   |
+note: required for `NotClone` to implement `Dyn`
+  --> tests/ui/bound_clone_unsatisfied.rs:6:1
+   |
+ 6 | #[dyn_shim(Dyn: Clone)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for the cast from `Box<NotClone>` to `Box<dyn Dyn>`
+   = note: this error originates in the attribute macro `dyn_shim` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `NotClone` with `#[derive(Clone)]`
+   |
+11 + #[derive(Clone)]
+12 | struct NotClone;
+   |

@@ -335,3 +335,212 @@ fn signature_and_attrs_preserved() {
     assert_eq!(unsafe { d.raw() }, -7);
     assert_eq!(d.c_abi(), 14);
 }
+
+// A recognized `Clone` bound is not a supertrait of the shim (that would
+// break dyn-compatibility). It becomes a bound on the blanket impl plus
+// hidden machinery that makes the shim's boxed trait objects cloneable.
+#[dyn_shim(DynSticker: Clone)]
+trait Sticker {
+    fn label(&self) -> String;
+    fn relabel(&mut self, to: &str);
+}
+
+#[derive(Clone)]
+struct Tag(String);
+impl Sticker for Tag {
+    fn label(&self) -> String {
+        self.0.clone()
+    }
+    fn relabel(&mut self, to: &str) {
+        self.0 = to.into();
+    }
+}
+
+#[test]
+fn clone_bound_clones_box() {
+    let original: Box<dyn DynSticker> = Box::new(Tag("a".into()));
+    let mut copy = original.clone();
+    copy.relabel("b");
+    assert_eq!(original.label(), "a");
+    assert_eq!(copy.label(), "b");
+}
+
+// The hidden clone machinery dispatches through `Clone` by name, so it works
+// even when the source trait declares its own method called `clone`. The two
+// never collide: the box's `Clone` impl copies the value, the shim method
+// forwards to the implementor's inherent trait method.
+#[dyn_shim(DynRevision: Clone)]
+trait Revision {
+    fn clone(&self) -> u32; // domain method, not std `Clone`
+}
+
+#[derive(Clone)]
+struct Doc(u32);
+impl Revision for Doc {
+    fn clone(&self) -> u32 {
+        self.0
+    }
+}
+
+#[test]
+fn clone_bound_with_clone_named_method() {
+    let original: Box<dyn DynRevision> = Box::new(Doc(7));
+    let copy = std::clone::Clone::clone(&original);
+    assert_eq!(DynRevision::clone(&*copy), 7);
+}
+
+// Recognized bounds compose with the rest of the list: auto traits stay
+// supertraits of the shim and additionally select which `dyn` marker
+// combinations get the `Clone` and `Hash` machinery, in any order, alongside
+// ordinary method skipping.
+#[allow(dead_code)]
+#[dyn_shim(DynColor: Hash + Send + Clone + Sync)]
+trait Color {
+    fn rgb(&self) -> (u8, u8, u8);
+    fn mix(&self, other: Self) -> Self; // skipped: mentions Self
+}
+
+#[derive(Clone, Hash)]
+struct Red;
+impl Color for Red {
+    fn rgb(&self) -> (u8, u8, u8) {
+        (255, 0, 0)
+    }
+    fn mix(&self, _other: Self) -> Self {
+        Red
+    }
+}
+
+#[test]
+fn clone_covers_marker_combinations() {
+    let plain: Box<dyn DynColor> = Box::new(Red);
+    assert_eq!(plain.clone().rgb(), (255, 0, 0));
+
+    // The clone keeps the marker, so it can cross the thread boundary.
+    let send: Box<dyn DynColor + Send> = Box::new(Red);
+    let copy = send.clone();
+    assert_eq!(
+        std::thread::spawn(move || copy.rgb()).join().unwrap(),
+        (255, 0, 0)
+    );
+
+    let sync: Box<dyn DynColor + Sync> = Box::new(Red);
+    assert_eq!(sync.clone().rgb(), (255, 0, 0));
+
+    // Marker order in the type is irrelevant; one impl covers each subset.
+    let both: Box<dyn Sync + Send + DynColor> = Box::new(Red);
+    assert_eq!(both.clone().rgb(), (255, 0, 0));
+}
+
+// The recognized auto traits are not limited to Send and Sync; any listed
+// std auto trait selects marker combinations.
+#[dyn_shim(DynGauge: Clone + Unpin)]
+trait Gauge {
+    fn level(&self) -> i32;
+}
+
+#[derive(Clone)]
+struct Dial(i32);
+impl Gauge for Dial {
+    fn level(&self) -> i32 {
+        self.0
+    }
+}
+
+#[test]
+fn clone_covers_listed_unpin_marker() {
+    let pinned: Box<dyn DynGauge + Unpin> = Box::new(Dial(7));
+    assert_eq!(pinned.clone().level(), 7);
+}
+
+#[test]
+fn hash_matches_concrete_value() {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let bh = BuildHasherDefault::<DefaultHasher>::default();
+
+    let boxed: Box<dyn DynColor> = Box::new(Red);
+    let by_ref: &dyn DynColor = &Red;
+    assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Red));
+    assert_eq!(bh.hash_one(by_ref), bh.hash_one(&Red));
+    // Box<dyn DynColor> hashes via std's forwarding impl for Box<T: Hash>.
+    assert_eq!(bh.hash_one(&boxed), bh.hash_one(&Red));
+    // Marker-variant dyn types hash through their own impls.
+    let marked: &(dyn DynColor + Send + Sync) = &Red;
+    assert_eq!(bh.hash_one(marked), bh.hash_one(&Red));
+}
+
+#[test]
+fn to_owned_escapes_borrow() {
+    use std::borrow::Cow;
+
+    let concrete = Red;
+    let borrowed: &dyn DynColor = &concrete;
+    // `.clone()` on a `&dyn` would copy the reference; `.to_owned()` returns
+    // an owned box.
+    let owned: Box<dyn DynColor> = borrowed.to_owned();
+    assert_eq!(owned.rgb(), (255, 0, 0));
+
+    let cow: Cow<'_, dyn DynColor> = Cow::Borrowed(borrowed);
+    let owned: Box<dyn DynColor> = cow.into_owned();
+    assert_eq!(owned.rgb(), (255, 0, 0));
+
+    // Marker variants get `ToOwned` too.
+    let borrowed: &(dyn DynColor + Send + Sync) = &concrete;
+    let owned: Box<dyn DynColor + Send + Sync> = borrowed.to_owned();
+    assert_eq!(
+        std::thread::spawn(move || owned.rgb()).join().unwrap(),
+        (255, 0, 0)
+    );
+}
+
+// Duplicate bounds are harmless, deduplicated like the language itself
+// dedupes `trait Foo: A + A`: the machinery and marker combos are generated
+// once.
+#[dyn_shim(DynBadge: Clone + Send + Clone + Send)]
+trait Badge {
+    fn number(&self) -> u32;
+}
+
+#[derive(Clone)]
+struct Lanyard(u32);
+impl Badge for Lanyard {
+    fn number(&self) -> u32 {
+        self.0
+    }
+}
+
+#[test]
+fn duplicate_bounds_dedupe() {
+    let badge: Box<dyn DynBadge + Send> = Box::new(Lanyard(3));
+    assert_eq!(badge.clone().number(), 3);
+}
+
+// A pass-through bound whose trait has associated types works when the
+// `dyn` type binds them at the use site. The bound mirrors the source
+// trait's supertrait, re-adding it to the shim.
+#[dyn_shim(DynSamples: Iterator)]
+trait Samples: Iterator {
+    fn label(&self) -> String;
+}
+
+struct Ramp(u8);
+impl Iterator for Ramp {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        self.0 += 1;
+        Some(self.0)
+    }
+}
+impl Samples for Ramp {
+    fn label(&self) -> String {
+        "ramp".into()
+    }
+}
+
+#[test]
+fn assoc_type_bound_binds_at_use_site() {
+    let mut source: Box<dyn DynSamples<Item = u8>> = Box::new(Ramp(0));
+    assert_eq!(source.label(), "ramp");
+    let head: Vec<u8> = source.by_ref().take(3).collect();
+    assert_eq!(head, [1, 2, 3]);
+}

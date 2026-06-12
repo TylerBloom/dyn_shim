@@ -1,0 +1,5 @@
+error: `PartialEq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)
+ --> tests/ui/bound_partial_eq.rs:4:17
+  |
+4 | #[dyn_shim(Dyn: PartialEq)]
+  |                 ^^^^^^^^^

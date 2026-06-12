@@ -1,0 +1,5 @@
+error: `PartialOrd` is not supported: the macro cannot define an order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)
+ --> tests/ui/bound_partial_ord.rs:4:17
+  |
+4 | #[dyn_shim(Dyn: PartialOrd)]
+  |                 ^^^^^^^^^^

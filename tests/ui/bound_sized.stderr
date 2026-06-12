@@ -1,0 +1,5 @@
+error: trait objects are unsized, so the shim's `dyn` type can never be `Sized`
+ --> tests/ui/bound_sized.rs:4:17
+  |
+4 | #[dyn_shim(Dyn: Sized)]
+  |                 ^^^^^

@@ -1,0 +1,5 @@
+error: `Ord` is not supported: the macro cannot define a total order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)
+ --> tests/ui/bound_ord.rs:5:17
+  |
+5 | #[dyn_shim(Dyn: Ord)]
+  |                 ^^^

@@ -1,0 +1,5 @@
+error: `Eq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)
+ --> tests/ui/bound_eq.rs:6:17
+  |
+6 | #[dyn_shim(Dyn: Eq)]
+  |                 ^^

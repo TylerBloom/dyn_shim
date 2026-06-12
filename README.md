@@ -35,6 +35,23 @@ trait Sink {
 }
 ```
 
+Bounds after the shim's name become its supertraits. A `Clone` or `Hash` in
+the list is recognized and handled specially: it makes the shim's trait
+objects themselves cloneable (including `ToOwned`) or hashable, covering the
+marker combinations of any auto traits listed alongside:
+
+```rust
+use dyn_shim::dyn_shim;
+
+#[dyn_shim(DynShape: Clone + Send)]
+trait Shape {
+    fn area(&self) -> f64;
+    fn scale(&mut self, factor: f64);
+}
+
+// Box<dyn DynShape> and Box<dyn DynShape + Send> implement Clone.
+```
+
 See the [API documentation](https://docs.rs/dyn_shim) for details.
 
 ## Testing

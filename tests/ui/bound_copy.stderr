@@ -1,0 +1,5 @@
+error: trait objects are unsized and can never be `Copy` (use a `Clone` bound to make the shim's boxes cloneable)
+ --> tests/ui/bound_copy.rs:5:17
+  |
+5 | #[dyn_shim(Dyn: Copy)]
+  |                 ^^^^

@@ -27,3 +27,41 @@ fn invalid_helper_attrs_rejected() {
     t.compile_fail("tests/ui/attr_non_method.rs");
     t.compile_fail("tests/ui/attr_unknown_arg.rs");
 }
+
+// A recognized bound (`Clone`, `Hash`) constrains the blanket impl, so an
+// implementor that does not satisfy it never receives the shim (a rustc
+// error; the pinned toolchain keeps the snapshot stable).
+#[test]
+fn recognized_bounds_rejected() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/bound_clone_unsatisfied.rs");
+    t.compile_fail("tests/ui/bound_hash_unsatisfied.rs");
+}
+
+// Bounds the macro recognizes only to reject: each would otherwise pass
+// through as a supertrait and break the shim with a confusing error far from
+// the cause. An arbitrary non-dyn-compatible trait cannot be recognized by
+// name, so it passes through and rustc rejects the shim at its first `dyn`
+// use site (a rustc error; the pinned toolchain keeps it stable).
+#[test]
+fn impossible_bounds_rejected() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/bound_copy.rs");
+    t.compile_fail("tests/ui/bound_sized.rs");
+    t.compile_fail("tests/ui/bound_default.rs");
+    t.compile_fail("tests/ui/bound_eq.rs");
+    t.compile_fail("tests/ui/bound_partial_eq.rs");
+    t.compile_fail("tests/ui/bound_ord.rs");
+    t.compile_fail("tests/ui/bound_partial_ord.rs");
+    t.compile_fail("tests/ui/bound_not_dyn_compatible.rs");
+    t.compile_fail("tests/ui/bound_path_form.rs");
+    t.compile_fail("tests/ui/bound_maybe_sized.rs");
+}
+
+// The marker coverage of a recognized bound is opt-in: combinations exist
+// only for auto traits actually listed in the bounds.
+#[test]
+fn unlisted_marker_not_covered() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/bound_clone_unlisted_marker.rs");
+}

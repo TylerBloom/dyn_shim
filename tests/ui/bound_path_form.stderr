@@ -1,0 +1,14 @@
+error[E0038]: the trait `Dyn` is not dyn compatible
+  --> tests/ui/bound_path_form.rs:20:20
+   |
+20 |     let b: Box<dyn Dyn> = Box::new(Widget);
+   |                    ^^^ `Dyn` is not dyn compatible
+   |
+note: for a trait to be dyn compatible it needs to allow building a vtable
+      for more information, visit <https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility>
+  --> tests/ui/bound_path_form.rs:6:17
+   |
+ 6 | #[dyn_shim(Dyn: std::clone::Clone)]
+   |            ---  ^^^^^^^^^^^^^^^^^ ...because it requires `Self: Sized`
+   |            |
+   |            this trait is not dyn compatible...

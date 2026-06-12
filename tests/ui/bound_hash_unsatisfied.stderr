@@ -1,0 +1,18 @@
+error[E0277]: the trait bound `NotHash: Dyn` is not satisfied
+  --> tests/ui/bound_hash_unsatisfied.rs:19:27
+   |
+19 |     let b: Box<dyn Dyn> = Box::new(NotHash);
+   |                           ^^^^^^^^^^^^^^^^^ the trait `Hash` is not implemented for `NotHash`
+   |
+note: required for `NotHash` to implement `Dyn`
+  --> tests/ui/bound_hash_unsatisfied.rs:6:1
+   |
+ 6 | #[dyn_shim(Dyn: Hash)]
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for the cast from `Box<NotHash>` to `Box<dyn Dyn>`
+   = note: this error originates in the attribute macro `dyn_shim` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `NotHash` with `#[derive(Hash)]`
+   |
+11 + #[derive(Hash)]
+12 | struct NotHash;
+   |

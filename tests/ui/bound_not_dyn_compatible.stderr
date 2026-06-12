@@ -1,0 +1,23 @@
+error[E0038]: the trait `Dyn` is not dyn compatible
+  --> tests/ui/bound_not_dyn_compatible.rs:28:20
+   |
+28 |     let b: Box<dyn Dyn> = Box::new(Widget);
+   |                    ^^^ `Dyn` is not dyn compatible
+   |
+note: for a trait to be dyn compatible it needs to allow building a vtable
+      for more information, visit <https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility>
+  --> tests/ui/bound_not_dyn_compatible.rs:7:8
+   |
+ 7 |     fn make() -> Self;
+   |        ^^^^ ...because associated function `make` has no `self` parameter
+...
+10 | #[dyn_shim(Dyn: Factory)]
+   |            --- this trait is not dyn compatible...
+help: consider turning `make` into a method by giving it a `&self` argument
+   |
+ 7 |     fn make(&self) -> Self;
+   |             +++++
+help: alternatively, consider constraining `make` so it does not apply to trait objects
+   |
+ 7 |     fn make() -> Self where Self: Sized;
+   |                       +++++++++++++++++
