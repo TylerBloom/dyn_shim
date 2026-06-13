@@ -20,7 +20,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-dyn_shim = "0.1"
+dyn_shim = "0.2"
 ```
 
 Annotate the trait with `#[dyn_shim(Name)]`, where `Name` is the shim trait to
