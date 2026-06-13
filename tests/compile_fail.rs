@@ -79,3 +79,13 @@ fn reflexive_impl_must_be_complete() {
     t.compile_fail("tests/ui/reflexive_unstubbed_method.rs");
     t.compile_fail("tests/ui/reflexive_unstubbed_multiple.rs");
 }
+
+// `dyn_shim_recognized` only knows `Clone` and `Hash`, and generates the shim's
+// contents itself, so an unrecognized trait and a shim that declares its own
+// items are both rejected by the macro.
+#[test]
+fn recognized_misuse_rejected() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/recognized_unknown_trait.rs");
+    t.compile_fail("tests/ui/recognized_has_items.rs");
+}

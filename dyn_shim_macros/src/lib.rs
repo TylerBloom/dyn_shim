@@ -1,0 +1,1865 @@
+//! Proc-macro implementation of the [`dyn_shim`](https://docs.rs/dyn_shim)
+//! crate. Depend on `dyn_shim`, not this crate directly: it re-exports these
+//! macros and adds the feature-gated `DynClone`/`DynHash` traits.
+//!
+//! [`macro@dyn_shim`] generates a dyn-compatible shim trait and blanket impl
+//! from a source trait that is not dyn-compatible; [`macro@dyn_shim_foreign`]
+//! does the same for a trait defined in another crate. See [`macro@dyn_shim`]
+//! for the method-forwarding and bounds rules, the reflexive impl, and the
+//! limitations.
+
+use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::{ToTokens, format_ident, quote};
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
+use syn::visit::{self, Visit};
+use syn::{
+    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, Receiver, ReturnType, Signature,
+    Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
+};
+
+/// Which reflexive `impl SourceTrait for <shim object>` the macro emits in
+/// addition to the blanket `impl<T: SourceTrait> Shim for T`, so the shim's
+/// trait object satisfies the source trait itself. Selected with
+/// `reflexive = bare` or `reflexive = boxed` in the attribute.
+#[derive(Clone, Copy, PartialEq)]
+enum Reflexive {
+    /// `impl SourceTrait for dyn Shim`. `Self` is the unsized `dyn` type, so a
+    /// by-value `self` receiver or a by-value `Self` in the signature cannot be
+    /// expressed.
+    Bare,
+    /// `impl SourceTrait for Box<dyn Shim>`. `Self` is the sized boxed type, so
+    /// by-value `self` and `-> Self` become `Box<dyn Shim>` and work.
+    Boxed,
+}
+
+impl Parse for Reflexive {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let kind: Ident = input.parse()?;
+        match kind.to_string().as_str() {
+            "bare" => Ok(Reflexive::Bare),
+            "boxed" => Ok(Reflexive::Boxed),
+            _ => Err(syn::Error::new_spanned(
+                kind,
+                "unsupported reflexive kind, expected `bare` or `boxed`",
+            )),
+        }
+    }
+}
+
+/// Parse an optional trailing `, reflexive = <kind>` from an attribute's
+/// argument list, after whatever each attribute reads first (the shim name and
+/// bounds for [`macro@dyn_shim`], the source path for
+/// [`macro@dyn_shim_foreign`]).
+fn parse_reflexive(input: ParseStream) -> syn::Result<Option<Reflexive>> {
+    if !input.peek(Token![,]) {
+        return Ok(None);
+    }
+    input.parse::<Token![,]>()?;
+    let key: Ident = input.parse()?;
+    if key != "reflexive" {
+        return Err(syn::Error::new_spanned(key, "expected `reflexive`"));
+    }
+    input.parse::<Token![=]>()?;
+    Ok(Some(input.parse()?))
+}
+
+/// Arguments to [`macro@dyn_shim`]: the shim trait's name, optionally followed
+/// by supertraits to put on it, written like a trait's supertrait list
+/// (`DynFoo: Send + Sync`), and an optional `, reflexive = bare | boxed`.
+struct Args {
+    shim_name: Ident,
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+    reflexive: Option<Reflexive>,
+}
+
+impl Parse for Args {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let shim_name = input.parse()?;
+        let mut bounds = Punctuated::new();
+        if input.peek(Token![:]) {
+            input.parse::<Token![:]>()?;
+            bounds = Punctuated::parse_separated_nonempty(input)?;
+        }
+        let reflexive = parse_reflexive(input)?;
+        Ok(Args {
+            shim_name,
+            bounds,
+            reflexive,
+        })
+    }
+}
+
+/// Arguments to [`macro@dyn_shim_foreign`]: the path to the foreign source
+/// trait, and an optional `, reflexive = bare | boxed`.
+struct ForeignArgs {
+    source: Path,
+    reflexive: Option<Reflexive>,
+}
+
+impl Parse for ForeignArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let source = input.parse()?;
+        let reflexive = parse_reflexive(input)?;
+        Ok(ForeignArgs { source, reflexive })
+    }
+}
+
+/// Arguments to [`macro@dyn_shim_recognized`]: a recognized std trait to expose
+/// as a shim (`Clone` or `Hash`), optionally followed by auto-trait markers
+/// selecting which `dyn` variants are covered (`Clone + Send + Sync`), written
+/// like a bound list.
+struct RecognizedArgs {
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+}
+
+impl Parse for RecognizedArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(RecognizedArgs {
+            bounds: Punctuated::parse_separated_nonempty(input)?,
+        })
+    }
+}
+
+/// The bound's trait path, if the bound is a plain trait name with no
+/// modifier or binder. Recognition applies only to bounds written bare:
+/// a modified or higher-ranked bound (`?Sized`, `for<'a> Fn(&'a str)`)
+/// passes through for rustc to judge.
+fn plain_trait_bound(bound: &TypeParamBound) -> Option<&syn::Path> {
+    match bound {
+        TypeParamBound::Trait(t)
+            if matches!(t.modifier, syn::TraitBoundModifier::None) && t.lifetimes.is_none() =>
+        {
+            Some(&t.path)
+        }
+        _ => None,
+    }
+}
+
+/// A std trait recognized in the bounds list. Such a trait cannot be a
+/// supertrait of a dyn-compatible trait, so instead of passing it through,
+/// the macro generates proxy machinery that implements it for the shim's
+/// trait objects.
+#[derive(Clone, Copy, PartialEq)]
+enum RecognizedBound {
+    Clone,
+    Hash,
+}
+
+impl RecognizedBound {
+    /// The absolute path this bound adds to the blanket impl: the proxy
+    /// methods need the implementor to actually be `Clone`/`Hash`.
+    fn impl_bound(self) -> TokenStream2 {
+        match self {
+            RecognizedBound::Clone => quote! { ::std::clone::Clone },
+            RecognizedBound::Hash => quote! { ::std::hash::Hash },
+        }
+    }
+
+    /// The line added to the generated shim's docs naming the capability, so
+    /// readers of a downstream crate's docs learn it without visiting this
+    /// crate's.
+    fn doc_line(self, shim: &Ident) -> String {
+        match self {
+            RecognizedBound::Clone => format!(
+                "`Box<dyn {shim}>` implements [`Clone`], and `dyn {shim}` implements \
+                 [`ToOwned`], both cloning the underlying concrete value."
+            ),
+            RecognizedBound::Hash => format!(
+                "`dyn {shim}` implements [`Hash`], hashing like the underlying \
+                 concrete value."
+            ),
+        }
+    }
+
+    /// The standalone shim trait (`::dyn_shim::DynClone` / `::dyn_shim::DynHash`)
+    /// to add as a supertrait of a recognized-*bound* shim, so that shim's `dyn`
+    /// type upcasts into the standalone one. Only when the matching crate
+    /// feature is enabled (which is what defines the standalone trait); `None`
+    /// otherwise, keeping the bound self-contained. Not applied to the standalone
+    /// shims themselves, which are built through `expand_recognized`.
+    fn dyn_supertrait(self) -> Option<TokenStream2> {
+        match self {
+            RecognizedBound::Clone if cfg!(feature = "dyn_clone") => {
+                Some(quote! { ::dyn_shim::DynClone })
+            }
+            RecognizedBound::Hash if cfg!(feature = "dyn_hash") => {
+                Some(quote! { ::dyn_shim::DynHash })
+            }
+            _ => None,
+        }
+    }
+
+    /// Generate the machinery for one recognized bound: hidden method
+    /// signatures for the shim trait, their bodies for the blanket impl, and
+    /// the standalone trait impls emitted after both.
+    fn expand(
+        self,
+        shim: &Ident,
+        combos: &[MarkerCombo],
+    ) -> (TokenStream2, TokenStream2, TokenStream2) {
+        match self {
+            RecognizedBound::Clone => expand_clone(shim, combos),
+            RecognizedBound::Hash => expand_hash(shim, combos),
+        }
+    }
+}
+
+/// A std auto trait recognized in the bounds list by its bare ident. A listed
+/// auto trait passes through as a supertrait like any other bound; in
+/// addition it selects which `dyn Shim + markers` types receive the machinery
+/// for recognized bounds such as `Clone`, since only auto traits can follow
+/// the principal trait in a trait object type.
+#[derive(Clone, Copy, PartialEq)]
+enum AutoTrait {
+    Send,
+    Sync,
+    Unpin,
+    UnwindSafe,
+    RefUnwindSafe,
+}
+
+impl AutoTrait {
+    /// The method-name suffix for a marker combination containing this trait.
+    fn suffix(self) -> &'static str {
+        match self {
+            AutoTrait::Send => "send",
+            AutoTrait::Sync => "sync",
+            AutoTrait::Unpin => "unpin",
+            AutoTrait::UnwindSafe => "unwind_safe",
+            AutoTrait::RefUnwindSafe => "ref_unwind_safe",
+        }
+    }
+
+    fn path(self) -> TokenStream2 {
+        match self {
+            AutoTrait::Send => quote! { ::std::marker::Send },
+            AutoTrait::Sync => quote! { ::std::marker::Sync },
+            AutoTrait::Unpin => quote! { ::std::marker::Unpin },
+            AutoTrait::UnwindSafe => quote! { ::std::panic::UnwindSafe },
+            AutoTrait::RefUnwindSafe => quote! { ::std::panic::RefUnwindSafe },
+        }
+    }
+}
+
+/// How one bound in the list is treated, decided by a single token match on
+/// its bare name.
+enum Classified {
+    /// A std trait the macro implements for the shim's trait objects instead
+    /// of passing it through as a supertrait (`Clone`, `Hash`).
+    Recognized(RecognizedBound),
+    /// An auto trait: passes through as a supertrait and additionally selects
+    /// which `dyn Shim + markers` types get the recognized-bound machinery.
+    Auto(AutoTrait),
+    /// A std name recognized only to be rejected, carrying its targeted error
+    /// message. Each would otherwise pass through as a supertrait and silently
+    /// make the shim non-dyn-compatible (or is simply impossible), surfacing
+    /// as a confusing rustc error far from the cause.
+    Rejected(&'static str),
+    /// Anything else: passed through to rustc as a supertrait.
+    PassThrough,
+}
+
+/// Classify one bound by its bare name. Every recognized, auto, and rejected
+/// name lives in exactly one arm here, so the categories cannot overlap and no
+/// caller has to check them in a particular order. Like the literal `where
+/// Self: Sized` check on methods, this is a token match: trait resolution is
+/// unavailable during expansion, so a path-form bound (`std::clone::Clone`)
+/// is not classified (it falls through to `PassThrough`), and a user-defined
+/// trait that happens to share one of these names is treated as the std one.
+fn classify(bound: &TypeParamBound) -> Classified {
+    let Some(ident) = plain_trait_bound(bound).and_then(syn::Path::get_ident) else {
+        return Classified::PassThrough;
+    };
+    match ident.to_string().as_str() {
+        "Clone" => Classified::Recognized(RecognizedBound::Clone),
+        "Hash" => Classified::Recognized(RecognizedBound::Hash),
+        "Send" => Classified::Auto(AutoTrait::Send),
+        "Sync" => Classified::Auto(AutoTrait::Sync),
+        "Unpin" => Classified::Auto(AutoTrait::Unpin),
+        "UnwindSafe" => Classified::Auto(AutoTrait::UnwindSafe),
+        "RefUnwindSafe" => Classified::Auto(AutoTrait::RefUnwindSafe),
+        "Copy" => Classified::Rejected(
+            "trait objects are unsized and can never be `Copy` (use a `Clone` bound to make the shim's boxes cloneable)",
+        ),
+        "Sized" => Classified::Rejected(
+            "trait objects are unsized, so the shim's `dyn` type can never be `Sized`",
+        ),
+        "Default" => Classified::Rejected(
+            "`Default` has no `self` receiver and cannot be dispatched through a trait object (construct values as concrete types and box them)",
+        ),
+        "PartialEq" => Classified::Rejected(
+            "`PartialEq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)",
+        ),
+        "Eq" => Classified::Rejected(
+            "`Eq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)",
+        ),
+        "PartialOrd" => Classified::Rejected(
+            "`PartialOrd` is not supported: the macro cannot define an order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)",
+        ),
+        "Ord" => Classified::Rejected(
+            "`Ord` is not supported: the macro cannot define a total order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)",
+        ),
+        _ => Classified::PassThrough,
+    }
+}
+
+/// One `dyn Shim + markers` variant the recognized-bound machinery covers: a
+/// method-name suffix and the `+ ...` tokens appended to the `dyn` type.
+struct MarkerCombo {
+    suffix: String,
+    markers: TokenStream2,
+}
+
+/// Every subset of the auto traits listed in the bounds, the plain (empty)
+/// combination first. The order markers are written in a `dyn` type does not
+/// affect type identity, so one impl per subset, each written in
+/// the order the auto traits were listed, covers every spelling at the use
+/// site. The count is `2^n` in the number of listed
+/// auto traits.
+fn marker_combos(autos: &[AutoTrait]) -> Vec<MarkerCombo> {
+    (0..1usize << autos.len())
+        .map(|mask| {
+            let mut suffix = String::new();
+            let mut markers = TokenStream2::new();
+            for (i, auto) in autos.iter().enumerate() {
+                if mask & (1 << i) == 0 {
+                    continue;
+                }
+                suffix.push('_');
+                suffix.push_str(auto.suffix());
+                let path = auto.path();
+                markers.extend(quote! { + #path });
+            }
+            MarkerCombo { suffix, markers }
+        })
+        .collect()
+}
+
+/// Machinery for a recognized `Clone` bound: per marker combination, a hidden
+/// method cloning into a fresh box, and a `Clone` impl for that box calling
+/// it. The marker has to be re-attached inside the blanket impl, where the
+/// concrete type is still known; a clone erased to a plain `Box<dyn Shim>`
+/// could never be coerced back to `Box<dyn Shim + Send>`. The `where Self:
+/// 'static` bound licenses the `Box<__T>` to `Box<dyn Shim>` coercion in the
+/// blanket impl without restricting the shim itself to `'static`
+/// implementors; it holds at every call site because `Box<dyn Shim>` is `+
+/// 'static` by default. (Unlike `Self: Sized`, it does not exclude the method
+/// from the vtable.)
+fn expand_clone(
+    shim: &Ident,
+    combos: &[MarkerCombo],
+) -> (TokenStream2, TokenStream2, TokenStream2) {
+    let mut sigs = TokenStream2::new();
+    let mut impls = TokenStream2::new();
+    let mut after = TokenStream2::new();
+    for MarkerCombo { suffix, markers } in combos {
+        let method = format_ident!("__dyn_shim_clone_box{suffix}");
+        sigs.extend(quote! {
+            #[doc(hidden)]
+            fn #method(&self) -> ::std::boxed::Box<dyn #shim #markers>
+            where
+                Self: 'static #markers;
+        });
+        impls.extend(quote! {
+            fn #method(&self) -> ::std::boxed::Box<dyn #shim #markers>
+            where
+                Self: 'static #markers,
+            {
+                ::std::boxed::Box::new(::std::clone::Clone::clone(self))
+            }
+        });
+        // `ToOwned` rides along with `Clone`: both are facades over the same
+        // hidden method, one for callers who own a box and one for callers
+        // holding only `&dyn Shim` (where `.clone()` would silently copy the
+        // reference). Legal because `Clone: Sized` keeps std's blanket
+        // `impl<T: Clone> ToOwned for T` away from the unsized `dyn` type,
+        // and `impl<T: ?Sized> Borrow<T> for Box<T>` supplies the
+        // `Owned: Borrow<Self>` half of the contract.
+        // The calls name `#shim`'s own method explicitly. When the shim also
+        // gains a `DynClone` supertrait (under the `dyn_clone` feature) it inherits
+        // a method of the same name, so a bare `self.#method()` would be
+        // ambiguous; the qualified form is unambiguous and harmless otherwise.
+        after.extend(quote! {
+            impl ::std::clone::Clone for ::std::boxed::Box<dyn #shim #markers> {
+                fn clone(&self) -> Self {
+                    <dyn #shim #markers as #shim>::#method(&**self)
+                }
+            }
+
+            impl ::std::borrow::ToOwned for dyn #shim #markers {
+                type Owned = ::std::boxed::Box<dyn #shim #markers>;
+                fn to_owned(&self) -> Self::Owned {
+                    <dyn #shim #markers as #shim>::#method(self)
+                }
+            }
+        });
+    }
+    (sigs, impls, after)
+}
+
+/// Machinery for a recognized `Hash` bound: one hidden method erasing the
+/// generic `H: Hasher` parameter to `&mut dyn Hasher` (lossless, since std
+/// implements `Hasher` for `&mut H` where `H: Hasher + ?Sized`), and a
+/// `Hash` impl on each `dyn` type calling it. Implementing on the `dyn`
+/// types directly means std's `impl<T: ?Sized + Hash> Hash for Box<T>`
+/// forwards for free and `&dyn Shim` is covered too. Hashing only reads, so
+/// one hidden method serves every marker combination.
+fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStream2, TokenStream2) {
+    let sigs = quote! {
+        #[doc(hidden)]
+        fn __dyn_shim_hash(&self, state: &mut dyn ::std::hash::Hasher);
+    };
+    let impls = quote! {
+        fn __dyn_shim_hash(&self, mut state: &mut dyn ::std::hash::Hasher) {
+            <__T as ::std::hash::Hash>::hash(self, &mut state)
+        }
+    };
+    let mut after = TokenStream2::new();
+    for MarkerCombo { markers, .. } in combos {
+        // Qualified so it stays unambiguous if the shim inherits a same-named
+        // method from a `DynHash` supertrait (under the `dyn_hash` feature).
+        after.extend(quote! {
+            impl ::std::hash::Hash for dyn #shim #markers {
+                fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
+                    <dyn #shim #markers as #shim>::__dyn_shim_hash(self, state)
+                }
+            }
+        });
+    }
+    (sigs, impls, after)
+}
+
+/// Generate a dyn-compatible shim for the annotated trait.
+///
+/// # Usage
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynFoo)]
+/// trait Foo {
+///     fn describe(&self) -> String;
+///
+///     fn make() -> Self;        // skipped: receiverless, not dyn-compatible
+///
+///     #[dyn_shim(skip)]
+///     fn debug_only(&self) {}   // skipped: opted out
+/// }
+/// ```
+///
+/// The original trait is left in place. A new trait `DynFoo` is generated
+/// alongside it, together with `impl<T: Foo> DynFoo for T`, so every
+/// implementor of `Foo` is automatically a `DynFoo` and can be used as `dyn
+/// DynFoo`. `DynFoo` inherits the source trait's visibility.
+///
+/// # Method Selection
+///
+/// A method is forwarded into the shim only if it can be dispatched through a
+/// trait object. The criteria below approximate the language's [Dyn
+/// Compatibility] rules per method. They catch the common reasons a method is
+/// not callable on a `dyn` type, but do not reproduce the full rule set. A
+/// method is **skipped** when any of the following holds:
+///
+/// - It has no `self` receiver (an associated function such as `fn new() -> Self`).
+/// - It is `async`.
+/// - It has a generic type or const parameter (lifetime parameters are fine).
+/// - Its return type or any argument type mentions `Self`, or uses `impl Trait`.
+/// - It requires `Self: Sized` (such a method is excluded from the vtable).
+/// - It is annotated with `#[dyn_shim(skip)]`.
+///
+/// Skipped methods stay on the source trait and are reached on the concrete
+/// type. A forwarded method keeps its entire signature — lifetimes, `where`
+/// clause, parameter names, `unsafe`, and any explicit ABI — as well as its
+/// attributes, so `#[doc]`, `#[must_use]`, `#[deprecated]`, and `#[cfg]`
+/// behave the same on the shim as on the source trait. A by-value
+/// `self` receiver is rewritten to `self: Box<Self>` and forwarded by
+/// dereferencing the box. A dispatchable receiver (`&self`, `&mut self`, or an
+/// explicit `self: Box<Self>`, `Rc<Self>`, `Arc<Self>`, or `Pin<_>`) is
+/// forwarded unchanged.
+///
+/// # Reflexive Impl
+///
+/// By default the shim is a distinct trait, so a `Box<dyn DynFoo>` is not a
+/// `Foo`. The optional `reflexive` argument additionally emits an impl of the
+/// source trait for the shim's trait object, so the erased value satisfies the
+/// source trait itself and can be passed to code written against `Foo`:
+///
+/// - `reflexive = boxed` emits `impl Foo for Box<dyn DynFoo>`. `Self` is the
+///   sized `Box<dyn DynFoo>`, so by-value `self` and `-> Self` methods work.
+/// - `reflexive = bare` emits `impl Foo for dyn DynFoo`, letting a `&dyn DynFoo`
+///   stand in for an `&impl Foo`. `Self` is the unsized `dyn DynFoo`, so a
+///   by-value `self` receiver, a `-> Self`, or a by-value `Self` argument cannot
+///   be expressed; use `reflexive = boxed` for a trait that has those.
+///
+/// The impl must account for every method of the source trait. A dyn-compatible
+/// method forwards through the shim. A method that is not dyn-compatible (see
+/// [Method Selection](#method-selection)) cannot forward, so it must either have
+/// a default body on the source trait (which the impl inherits) or be annotated
+/// `#[dyn_shim(panic)]` to get a stub that panics if it is ever called through
+/// the shim. A method that is neither is a compile error naming it.
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynMunch, reflexive = boxed)]
+/// trait Munch {
+///     fn crunch(self) -> u32;   // by-value self: forwarded
+///     #[dyn_shim(panic)]
+///     fn fresh() -> Self;       // receiverless: panicking stub
+/// }
+///
+/// struct Apple(u32);
+/// impl Munch for Apple {
+///     fn crunch(self) -> u32 { self.0 }
+///     fn fresh() -> Self { Apple(1) }
+/// }
+///
+/// fn eat(m: impl Munch) -> u32 { m.crunch() }
+///
+/// // Box<dyn DynMunch> is a Munch, so it can be passed to code expecting one.
+/// let m: Box<dyn DynMunch> = Box::new(Apple(7));
+/// assert_eq!(eat(m), 7);
+/// ```
+///
+/// The `reflexive` argument and the `#[dyn_shim(panic)]` helper work the same on
+/// [`macro@dyn_shim_foreign`].
+///
+/// # Bounds
+///
+/// The generated shim has no supertraits by default — not even the source
+/// trait's. Optional bounds after the shim's name, written like a trait's
+/// supertrait list, are added as supertraits of the shim and as bounds on the
+/// blanket impl:
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynJob: Send + Sync)]
+/// trait Job {
+///     fn run(&self) -> u32;
+/// }
+///
+/// struct Sleep;
+/// impl Job for Sleep {
+///     fn run(&self) -> u32 { 1 }
+/// }
+///
+/// let job: Box<dyn DynJob> = Box::new(Sleep);
+/// assert_eq!(std::thread::spawn(move || job.run()).join().unwrap(), 1);
+/// ```
+///
+/// This is also the way to re-add a supertrait of the source trait, making its
+/// methods callable on the shim's `dyn` type (`DynShim: std::fmt::Display`,
+/// for example).
+///
+/// The shim's bounds should generally mirror the source trait's supertraits,
+/// keeping the shim a faithful dyn-compatible view of the source. Auto
+/// traits are the common exception: a `Send` or `Sync` bound describes
+/// implementors rather than the trait's contract, so it usually appears only
+/// on the shim, as above.
+///
+/// A bound the source trait does not require deserves a warning, because it
+/// does not behave like the supertrait it is spelled as:
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynFoo: Iterator)]
+/// trait Foo {
+///     fn describe(&self) -> String;
+/// }
+///
+/// // Implements Foo, but not Iterator.
+/// struct Bar;
+/// impl Foo for Bar {
+///     fn describe(&self) -> String { "bar".into() }
+/// }
+///
+/// // Compiles: implementing Foo carries no Iterator obligation. Bar just
+/// // silently never receives the DynFoo blanket impl, so this would fail:
+/// // let b: Box<dyn DynFoo<Item = u8>> = Box::new(Bar);
+/// ```
+///
+/// Had `trait DynFoo: Iterator` been written by hand, each
+/// `impl DynFoo for ...` would be checked against the supertrait, making an
+/// implementor without `Iterator` an error at its `impl`. But nobody writes
+/// impls of the shim. There is only the blanket impl, and a bound there is a
+/// filter, not an obligation: `Bar` implements `Foo` fine, never becomes a
+/// `DynFoo`, and errors only where it is used as `Box<dyn DynFoo>`, which
+/// may be far from the mistake, or nowhere. Mirroring the bound as a
+/// supertrait of the source (`trait Foo: Iterator`) restores the immediate
+/// per-impl check.
+///
+/// **The macro cannot classify the listed bounds.** Trait resolution is
+/// unavailable during macro expansion, so whether a named trait is
+/// dyn-compatible cannot be decided there. Auto traits such as `Send` and
+/// `Sync`, lifetimes such as `'static`, and dyn-compatible traits pass
+/// through and work as supertraits. A few std names are handled specially by
+/// token match: [recognized](#recognized-bounds) ones get generated
+/// machinery, and [known-impossible](#rejected-bounds) ones get a targeted
+/// error. Anything else that breaks the shim (a non-dyn-compatible user
+/// trait, a path-form `std::clone::Clone`) makes the shim non-dyn-compatible
+/// too; rustc reports that at the first place `dyn Shim` is written, not at
+/// the attribute. An implementor of the source trait that does not satisfy
+/// the bounds does not receive the shim impl.
+///
+/// ## Recognized Bounds
+///
+/// `Clone` and `Hash` are exceptions to the rule above. Neither can be a
+/// supertrait of a dyn-compatible trait, so a literal `Clone` or `Hash` in
+/// the bounds list is intercepted instead of passed through. It still bounds
+/// the blanket impl (an implementor that is not `Clone` does not receive the
+/// shim), and instead of a supertrait the macro generates the machinery that
+/// implements the trait for the shim's trait objects:
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+/// use std::hash::{DefaultHasher, Hash, Hasher};
+///
+/// #[dyn_shim(DynShape: Clone + Hash)]
+/// trait Shape {
+///     fn area(&self) -> u32;
+/// }
+///
+/// #[derive(Clone, Hash)]
+/// struct Rect(u32, u32);
+/// impl Shape for Rect {
+///     fn area(&self) -> u32 { self.0 * self.1 }
+/// }
+///
+/// let shapes: Vec<Box<dyn DynShape>> = vec![Box::new(Rect(2, 3))];
+/// let copy = shapes.clone(); // Box<dyn DynShape>: Clone
+/// assert_eq!(copy[0].area(), 6);
+///
+/// let mut hasher = DefaultHasher::new();
+/// shapes[0].hash(&mut hasher); // Box<dyn DynShape>: Hash
+///
+/// let borrowed: &dyn DynShape = &Rect(2, 3);
+/// let owned: Box<dyn DynShape> = borrowed.to_owned(); // dyn DynShape: ToOwned
+/// assert_eq!(owned.area(), 6);
+/// ```
+///
+/// `Clone` is implemented for `Box<dyn Shim>`. `Hash` is implemented for
+/// `dyn Shim` itself, which also covers `&dyn Shim` and, through std's
+/// forwarding impl, `Box<dyn Shim>`. Cloning requires `'static` contents:
+/// `Box<dyn Shim + 'a>` does not get `Clone`.
+///
+/// With the crate's `dyn_clone` (or `dyn_hash`) feature enabled, a recognized `Clone`
+/// (or `Hash`) bound additionally makes the shim a subtrait of the standalone
+/// `dyn_shim::DynClone` (or `dyn_shim::DynHash`). The shim's `dyn` type then
+/// upcasts into the standalone one, so a `Box<dyn Shim>` flows into an API typed
+/// against `Box<dyn DynClone>` (and a `&dyn Shim` into `&dyn DynHash`). Without
+/// the feature the bound is self-contained and adds no such supertrait.
+///
+/// A recognized `Clone` also implements `ToOwned` for the `dyn` type. The
+/// two are facades over the same machinery serving different callers:
+/// `Clone` duplicates a box you already own, while `to_owned` lets a caller
+/// holding only a borrowed `&dyn Shim` escape the borrow with an owned copy.
+/// That borrowed edge is otherwise a footgun, since `&T` is itself `Clone`:
+/// `shape_ref.clone()` compiles and silently copies the reference, not the
+/// value. `ToOwned` is also what `Cow<'_, dyn Shim>` requires, enabling APIs
+/// that pass borrowed values through untouched and allocate only on the
+/// owning path.
+///
+/// Auto traits listed in the bounds select which marker types are covered as
+/// well. For each subset of the listed auto traits (`Send`, `Sync`, `Unpin`,
+/// `UnwindSafe`, and `RefUnwindSafe` are recognized), the trait is also
+/// implemented for `Box<dyn Shim + markers>` (`dyn Shim + markers` for
+/// `Hash`): `Clone + Send` covers `Box<dyn Shim>` and `Box<dyn Shim + Send>`.
+/// A listed auto trait otherwise behaves as before, becoming a supertrait of
+/// the shim and a bound on the blanket impl. Position in the bounds list
+/// never matters, nor does marker order at the use site (`Box<dyn Send +
+/// Shim>` is the same type). The number of generated impls doubles with each
+/// listed auto trait.
+///
+/// Like the literal `where Self: Sized` check on methods, recognition is a
+/// token match on the bare name: a path-form `std::clone::Clone` is passed
+/// through as a supertrait (breaking the shim's dyn-compatibility), and a
+/// user-defined trait named `Clone` is intercepted. Trait resolution is
+/// unavailable during expansion, so the macro cannot see what a name is
+/// imported as; the bare ident is all it has.
+///
+/// The same applies to the auto traits that select marker combinations. Only
+/// a bare `Send` (or `Sync`, `Unpin`, `UnwindSafe`, `RefUnwindSafe`) is added
+/// to the covered subsets. A path-form `std::marker::Send` still passes
+/// through as a supertrait, so the bound itself compiles, but it is left out
+/// of the marker machinery, so `Box<dyn Shim + Send>` never receives the
+/// `Clone` or `Hash` impl. The miss surfaces as a trait-bound error at the
+/// `Box<dyn Shim + Send>` use site, not at the attribute. Write auto traits
+/// bare when they should drive the marker combinations.
+///
+/// The generated machinery names the shim's `dyn` type bare (`Box<dyn
+/// Shim>`), which requires every associated type of every supertrait to be
+/// fixed. So a recognized bound combines with a bound whose trait has
+/// associated types (such as `Iterator`) only when the bounds list binds
+/// them: `Clone + Iterator<Item = u8>` works, while `Clone + Iterator` does
+/// not, since an unbound `Item` could only be supplied at a use site, which
+/// the generated impls never see.
+///
+/// ## Rejected Bounds
+///
+/// Some std names are recognized only to be rejected with a targeted error,
+/// because no machinery could make them work: `Copy` and `Sized` contradict
+/// being a trait object, and `Default` has no receiver for a vtable to
+/// dispatch on. The comparison traits are rejected too: `PartialEq` and `Eq`
+/// need an `Any` downcast the macro does not generate yet, and `PartialOrd`
+/// and `Ord` would make the macro invent an order between unrelated concrete
+/// types, which is not its call. Sort with `sort_by_key`, or implement the
+/// comparison traits on the `dyn` type by hand: the crate invoking the macro
+/// owns the shim trait, so coherence permits `impl Ord for dyn Shim` there
+/// (std's forwarding impls carry it onto the boxes), and the generated
+/// machinery stays out of the way.
+///
+/// Rejection is a bare-name token match, with the same blind spot as
+/// recognition: the macro cannot see what a name resolves to. A user-defined
+/// trait that happens to be named `Ord` (or any of the rejected names) is
+/// caught too, and reported with the message written for the std trait, even
+/// when that trait is dyn-compatible and would work as a supertrait. Write it
+/// path-qualified (`self::Ord`, `crate::cmp::Ord`) to pass it through: a
+/// multi-segment path is not a bare ident, so it skips the rejection list and
+/// becomes an ordinary supertrait.
+///
+/// ## Bounds That Need No Entry
+///
+/// A dyn-compatible trait works as a plain pass-through bound; nothing needs
+/// recognizing. This covers, among many others, `Debug`, `Display`,
+/// `std::error::Error`, the auto traits, `AsRef<T>` and `Borrow<T>`,
+/// `std::io::Read`/`Write`/`Seek`, `Iterator`, and `Future`. The last two
+/// carry associated types, which need one extra step; see
+/// [Bounds With Associated Types](#bounds-with-associated-types).
+///
+/// `Any` is worth singling out: trait object upcasting is built into the
+/// language, so an `Any` bound already enables downcasting with no generated
+/// machinery:
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+/// use std::any::Any;
+///
+/// #[dyn_shim(DynShape: Any)]
+/// trait Shape {
+///     fn area(&self) -> u32;
+/// }
+///
+/// struct Rect(u32, u32);
+/// impl Shape for Rect {
+///     fn area(&self) -> u32 { self.0 * self.1 }
+/// }
+///
+/// let shape: Box<dyn DynShape> = Box::new(Rect(2, 3));
+/// let any: &dyn Any = &*shape; // upcasting coercion
+/// assert!(any.downcast_ref::<Rect>().is_some());
+/// ```
+///
+/// ## Bounds With Associated Types
+///
+/// A bound whose trait has associated types, such as `Iterator` or
+/// `Future`, passes through like any other dyn-compatible trait, but the
+/// associated types must be bound before the shim's `dyn` type can be
+/// written. There are two places to bind them, and they trade against each
+/// other:
+///
+/// - **At the use site.** The bounds list names the bare trait
+///   (`DynSamples: Iterator`), and every spot that writes the `dyn` type
+///   supplies the bindings: `Box<dyn DynSamples<Item = u8>>`. One shim
+///   serves every item type, each collection picking its own binding, but
+///   the bare `dyn DynSamples` is not a nameable type (forgetting the
+///   binding is a "must be specified" error at that spot).
+/// - **In the bounds list.** `DynSamples: Iterator<Item = u8>` fixes the
+///   associated type for every implementor, so the bare `dyn DynSamples`
+///   is nameable. Only implementors with exactly that item type receive
+///   the shim, and this is the only form that combines with
+///   [recognized bounds](#recognized-bounds), whose generated machinery
+///   must name the `dyn` type bare.
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynSamples: Iterator)]
+/// trait Samples: Iterator {
+///     fn label(&self) -> String;
+/// }
+///
+/// struct Ramp(u8);
+/// impl Iterator for Ramp {
+///     type Item = u8;
+///     fn next(&mut self) -> Option<u8> {
+///         self.0 += 1;
+///         Some(self.0)
+///     }
+/// }
+/// impl Samples for Ramp {
+///     fn label(&self) -> String { "ramp".into() }
+/// }
+///
+/// let mut source: Box<dyn DynSamples<Item = u8>> = Box::new(Ramp(0));
+/// assert_eq!(source.label(), "ramp");
+/// let head: Vec<u8> = source.by_ref().take(3).collect();
+/// assert_eq!(head, [1, 2, 3]);
+/// ```
+///
+/// # Limitations
+///
+/// A skipped method (see [Method Selection](#method-selection)) is not a
+/// limitation of this macro: it cannot be dispatched through any trait object,
+/// so no shim could forward it. The limitations specific to this macro are:
+///
+/// - **The source trait may not be generic.** A trait with type, const, or
+///   lifetime parameters is rejected with a compile error. Such a trait can
+///   still be dyn-compatible on its own (`dyn Trait<i32>`); the macro just does
+///   not generate a parameterized shim for it.
+/// - **Supertraits are not inherited.** The macro cannot tell whether a
+///   supertrait is dyn-compatible, so it carries none of them onto the shim and
+///   their methods are not callable on the shim's `dyn` type. Re-add the ones
+///   you need — and know to be dyn-compatible — as [bounds on the shim's
+///   name](#bounds).
+/// - **Only a literal `where Self: Sized` bound is recognized.** Classifying any
+///   other `Self:` bound would need trait resolution, which is unavailable during
+///   macro expansion, so such a method is forwarded as written. This is correct
+///   for an auto-trait bound like `Self: Send` (call it through `&(dyn Shim +
+///   Send)`), but a `Self: Clone` bound produces a method that cannot be called
+///   on the shim's `dyn` type, and a `Self: Debug` bound produces a shim that
+///   does not compile. Annotate such a method with `#[dyn_shim(skip)]`.
+///
+/// [Dyn Compatibility]: https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility
+///
+/// # Example
+///
+/// ```
+/// use dyn_shim::dyn_shim;
+///
+/// #[dyn_shim(DynSink)]
+/// trait Sink {
+///     fn connect() -> Self;                 // skipped: receiverless
+///     fn write(&mut self, line: &str);
+///     fn total(&self) -> usize;
+///     fn finish(self) -> usize;             // by-value -> self: Box<Self>
+///     #[dyn_shim(skip)]
+///     fn debug_only(&self) {}               // skipped: opted out
+/// }
+///
+/// #[derive(Default)]
+/// struct Buf { lines: usize }
+/// impl Sink for Buf {
+///     fn connect() -> Self { Buf::default() }
+///     fn write(&mut self, _line: &str) { self.lines += 1; }
+///     fn total(&self) -> usize { self.lines }
+///     fn finish(self) -> usize { self.lines }
+/// }
+///
+/// let mut s: Box<dyn DynSink> = Box::new(Buf::connect());
+/// s.write("a");
+/// s.write("b");
+/// assert_eq!(s.total(), 2);
+/// assert_eq!(s.finish(), 2);
+/// ```
+#[proc_macro_attribute]
+pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let Args {
+        shim_name,
+        bounds,
+        reflexive,
+    } = parse_macro_input!(attr as Args);
+    let input = parse_macro_input!(item as ItemTrait);
+    // The source trait is local: refer to it by its own name, and re-emit it.
+    let source_ref = input.ident.to_token_stream();
+    let source_doc = input.ident.to_string();
+    expand(
+        shim_name,
+        bounds,
+        &input,
+        &source_ref,
+        &source_doc,
+        true,
+        reflexive,
+    )
+}
+
+/// Generate a dyn-compatible shim for a trait defined in another crate.
+///
+/// `#[dyn_shim]` must sit on the trait's own definition, so it cannot target a
+/// trait you do not own. This attribute fills that gap. Its sole argument is the
+/// path to the foreign source trait, and the trait it is written on *is* the
+/// shim: its name names the shim, its supertrait list supplies the bounds, and
+/// its body restates the methods to forward.
+///
+/// ```
+/// use dyn_shim::dyn_shim_foreign;
+///
+/// // Stands in for a trait defined in a dependency.
+/// mod other_crate {
+///     pub trait Sink {
+///         fn write(&mut self, line: &str);
+///         fn total(&self) -> usize;
+///         fn finish(self) -> usize;
+///     }
+/// }
+///
+/// #[dyn_shim_foreign(other_crate::Sink)]
+/// trait DynSink {
+///     fn write(&mut self, line: &str);
+///     fn total(&self) -> usize;
+///     fn finish(self) -> usize; // by-value -> self: Box<Self>
+/// }
+///
+/// struct Buf(usize);
+/// impl other_crate::Sink for Buf {
+///     fn write(&mut self, _line: &str) { self.0 += 1; }
+///     fn total(&self) -> usize { self.0 }
+///     fn finish(self) -> usize { self.0 }
+/// }
+///
+/// let mut s: Box<dyn DynSink> = Box::new(Buf(0));
+/// s.write("a");
+/// assert_eq!(s.total(), 1);
+/// assert_eq!(s.finish(), 1);
+/// ```
+///
+/// # How It Differs From [`macro@dyn_shim`]
+///
+/// `#[dyn_shim]` reads a source trait and emits a *second*, shim trait beside
+/// it. `#[dyn_shim_foreign]` has no source trait to read — it lives in another
+/// crate — so the annotated trait is the shim directly: it is consumed and
+/// re-emitted with the forwarding machinery filled in, rather than copied. The
+/// blanket impl forwards to the foreign path
+/// (`impl<T: other_crate::Sink> DynSink for T`), which coherence permits: the
+/// shim trait is local, so a blanket impl of it is allowed however foreign the
+/// source trait is, and the recognized-bound machinery lands on the local
+/// `dyn` types. The shim's name, visibility, supertrait list, and method
+/// selection all read off the annotated trait, so [method selection], [bounds],
+/// and [recognized bounds] work exactly as for [`macro@dyn_shim`] — a `Clone`
+/// or `Hash` in the supertrait list is recognized, auto traits pass through and
+/// select marker combinations, and so on.
+///
+/// One thing follows from the source trait being foreign: **the signatures must
+/// be restated by hand.** A proc macro sees only its own input tokens, never
+/// another crate's AST, so it cannot read the foreign trait's methods. List the
+/// dyn-compatible ones you want forwarded; omit the rest (a receiverless
+/// `fn build() -> Self` simply has no place in the shim anyway). A restated
+/// signature that does not match the real one is caught when the generated
+/// `<T as other_crate::Sink>::method(..)` call fails to compile.
+///
+/// The trailing `reflexive = bare | boxed` argument
+/// (`#[dyn_shim_foreign(other_crate::Sink, reflexive = boxed)]`) and the
+/// `#[dyn_shim(panic)]` method helper work here too, emitting `impl
+/// other_crate::Sink for Box<dyn DynSink>` so the boxed shim satisfies the
+/// foreign trait. See [reflexive impl](macro@dyn_shim#reflexive-impl).
+///
+/// [method selection]: macro@dyn_shim#method-selection
+/// [bounds]: macro@dyn_shim#bounds
+/// [recognized bounds]: macro@dyn_shim#recognized-bounds
+#[proc_macro_attribute]
+pub fn dyn_shim_foreign(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // The first argument is the foreign source trait's path; everything else is
+    // read off the annotated trait, which is itself the shim.
+    let ForeignArgs { source, reflexive } = parse_macro_input!(attr as ForeignArgs);
+    let input = parse_macro_input!(item as ItemTrait);
+    let source_ref = source.to_token_stream();
+    let source_doc = path_doc_string(&source);
+    // No source trait to re-emit: the annotated trait is the shim, regenerated
+    // from its own name, supertraits, and restated signatures.
+    let shim_name = input.ident.clone();
+    let bounds = input.supertraits.clone();
+    expand(
+        shim_name,
+        bounds,
+        &input,
+        &source_ref,
+        &source_doc,
+        false,
+        reflexive,
+    )
+}
+
+/// Expose a recognized std trait as a standalone dyn-compatible shim.
+///
+/// `Clone` and `Hash` cannot be supertraits of a dyn-compatible trait, so they
+/// cannot be shimmed by restating them through [`macro@dyn_shim_foreign`]: the
+/// dyn-compatible form is not a subset of their methods but a transform of them
+/// (erasing `Clone::clone`'s `-> Self` into a boxing clone, and `Hash::hash`'s
+/// generic `H: Hasher` into `&mut dyn Hasher`). That transform is built into the
+/// macro, so this attribute needs only the trait name; the shim it is written
+/// on supplies the shim's name and visibility and must have an empty body.
+///
+/// ```
+/// use dyn_shim::dyn_shim_recognized;
+///
+/// #[dyn_shim_recognized(Clone)]
+/// trait DynClone {}
+///
+/// #[derive(Clone)]
+/// struct Widget(u32);
+///
+/// // No impl of `DynClone` is written: `impl<T: Clone> DynClone for T` is
+/// // generated, and `Box<dyn DynClone>` is itself `Clone`.
+/// let a: Box<dyn DynClone> = Box::new(Widget(7));
+/// let _b = a.clone();
+/// ```
+///
+/// The result mirrors the `dyn_clone` and `dyn_hash` crates: `Box<dyn DynClone>`
+/// implements `Clone` (and `dyn DynClone` implements `ToOwned`), and `dyn
+/// DynHash` implements `Hash` (covering `Box<dyn DynHash>` through std's
+/// forwarding impl). It is the same machinery a recognized [bound] generates on
+/// a host shim, with the recognized trait as the principal instead.
+///
+/// Auto-trait markers listed after the trait select which `dyn` variants are
+/// covered, exactly as in the bound form: `#[dyn_shim_recognized(Clone + Send)]`
+/// makes both `Box<dyn DynClone>` and `Box<dyn DynClone + Send>` cloneable. The
+/// markers are not supertraits of the shim, so they do not constrain its
+/// implementors; only the marked `dyn` variant's machinery requires them.
+///
+/// [bound]: macro@dyn_shim#recognized-bounds
+#[proc_macro_attribute]
+pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let RecognizedArgs { bounds } = parse_macro_input!(attr as RecognizedArgs);
+    let input = parse_macro_input!(item as ItemTrait);
+    expand_recognized(&input, bounds)
+}
+
+/// Render a path as `a::b::C` for doc links, dropping any generic arguments.
+fn path_doc_string(path: &Path) -> String {
+    let mut out = String::new();
+    if path.leading_colon.is_some() {
+        out.push_str("::");
+    }
+    for (i, segment) in path.segments.iter().enumerate() {
+        if i > 0 {
+            out.push_str("::");
+        }
+        out.push_str(&segment.ident.to_string());
+    }
+    out
+}
+
+/// Shared expansion for both attributes. `input` is the annotated trait, read
+/// for the shim's visibility, generics, and method signatures (and, for the
+/// local form, re-emitted). `source_ref` is how the source trait is named in
+/// the blanket impl and the forwarding calls (an ident for the local form, a
+/// path for the foreign one); `source_doc` is its `::`-joined spelling for doc
+/// links. `reemit` is `true` for the local form, which owns the source trait
+/// and re-emits it with a dyn-compat doc note, and `false` for the foreign
+/// form, whose annotated trait is the shim itself. `reflexive`, when set, also
+/// emits an `impl SourceTrait for <shim object>` so the shim's trait object
+/// satisfies the source trait.
+fn expand(
+    shim_name: Ident,
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+    input: &ItemTrait,
+    source_ref: &TokenStream2,
+    source_doc: &str,
+    reemit: bool,
+    reflexive: Option<Reflexive>,
+) -> TokenStream {
+    if let Some(param) = input.generics.params.first() {
+        return syn::Error::new_spanned(param, "dyn_shim does not support generic source traits")
+            .to_compile_error()
+            .into();
+    }
+    let vis = &input.vis;
+    let items = &input.items;
+
+    // Partition the bounds list. A recognized std trait (`Clone`, `Hash`) is
+    // drained: as a supertrait it would break dyn-compatibility, so it
+    // instead becomes a bound on the blanket impl plus proxy machinery on the
+    // shim's trait objects. A recognized auto trait passes through like any
+    // other bound and additionally selects which `dyn Shim + markers` types
+    // get that machinery. Position in the list never matters.
+    let mut recognized = Vec::new();
+    let mut autos = Vec::new();
+    let mut passthrough: Punctuated<TypeParamBound, Token![+]> = Punctuated::new();
+    for bound in bounds {
+        // Duplicates are deduplicated silently, matching the language's own
+        // tolerance of `trait Foo: A + A`.
+        match classify(&bound) {
+            Classified::Rejected(msg) => {
+                return syn::Error::new_spanned(&bound, msg)
+                    .to_compile_error()
+                    .into();
+            }
+            Classified::Recognized(k) => {
+                if !recognized.contains(&k) {
+                    recognized.push(k);
+                }
+            }
+            Classified::Auto(auto) => {
+                if !autos.contains(&auto) {
+                    autos.push(auto);
+                }
+                passthrough.push(bound);
+            }
+            Classified::PassThrough => passthrough.push(bound),
+        }
+    }
+    // The marker combinations feed the recognized-bound machinery and the
+    // reflexive impl (one per `dyn Shim + markers` variant), so there is
+    // nothing to compute when neither is present.
+    let combos = if recognized.is_empty() && reflexive.is_none() {
+        Vec::new()
+    } else {
+        marker_combos(&autos)
+    };
+
+    // Validate the `#[dyn_shim(...)]` helper attributes: on a method the only
+    // supported argument is `skip`; on any other trait item the attribute is
+    // rejected outright. Only methods are stripped of it before the trait is
+    // re-emitted, so left in place rustc would re-expand it as this attribute
+    // macro and fail with an unrelated parse error pointing at the item.
+    for item in items {
+        let attrs = match item {
+            TraitItem::Fn(item) => {
+                for attr in item.attrs.iter().filter(|a| a.path().is_ident("dyn_shim")) {
+                    if let Err(err) = parse_helper(attr) {
+                        return err.to_compile_error().into();
+                    }
+                }
+                continue;
+            }
+            TraitItem::Const(item) => &item.attrs,
+            TraitItem::Type(item) => &item.attrs,
+            TraitItem::Macro(item) => &item.attrs,
+            _ => continue,
+        };
+        if let Some(attr) = attrs.iter().find(|a| a.path().is_ident("dyn_shim")) {
+            return syn::Error::new_spanned(
+                attr,
+                "#[dyn_shim] attributes are only supported on methods",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+
+    let mut sigs = Vec::new();
+    let mut impls = Vec::new();
+    let mut skipped: Vec<(String, &str)> = Vec::new();
+    for item in items {
+        let TraitItem::Fn(method) = item else {
+            continue;
+        };
+        match skip(method) {
+            Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
+            None => {
+                let (sig, body) = forward(method, source_ref);
+                sigs.push(sig);
+                impls.push(body);
+            }
+        }
+    }
+
+    // Re-emit the source trait (local form only) without our
+    // `#[dyn_shim(skip)]` helper attributes, and point its docs at the
+    // generated shim. The foreign form reads only the signatures above and
+    // emits nothing for the annotated trait.
+    let clean = reemit.then(|| {
+        let mut clean = input.clone();
+        for item in &mut clean.items {
+            if let TraitItem::Fn(method) = item {
+                method.attrs.retain(|a| !a.path().is_ident("dyn_shim"));
+            }
+        }
+        for line in source_note(&shim_name) {
+            clean.attrs.push(syn::parse_quote! { #[doc = #line] });
+        }
+        clean
+    });
+
+    let doc_attrs = shim_doc(source_doc, &shim_name, &recognized, &skipped)
+        .into_iter()
+        .map(|line| quote! { #[doc = #line] });
+
+    // The passed-through bounds become the shim's supertraits, so the blanket
+    // impl must require them of the implementor as well. A recognized bound
+    // requires its trait of the implementor too, but only on the impl. Under
+    // the `dyn_clone`/`dyn_hash` features a recognized `Clone`/`Hash` also adds the
+    // standalone `DynClone`/`DynHash` as a supertrait, so the shim's `dyn` type
+    // upcasts into that standalone shim. The blanket impl needs no extra bound
+    // for it: its `Clone`/`Hash` bound already implies `DynClone`/`DynHash`.
+    let mut shim_supers: Vec<TokenStream2> = passthrough.iter().map(|b| quote! { #b }).collect();
+    for k in &recognized {
+        if let Some(path) = k.dyn_supertrait() {
+            shim_supers.push(path);
+        }
+    }
+    let supertraits = (!shim_supers.is_empty()).then(|| quote! { : #(#shim_supers)+* });
+    let impl_bounds = (!passthrough.is_empty()).then(|| quote! { + #passthrough });
+    let recognized_bounds: TokenStream2 = recognized
+        .iter()
+        .map(|k| {
+            let path = k.impl_bound();
+            quote! { + #path }
+        })
+        .collect();
+
+    let mut recognized_sigs = TokenStream2::new();
+    let mut recognized_impls = TokenStream2::new();
+    let mut recognized_extra = TokenStream2::new();
+    for k in &recognized {
+        let (sigs, impls, extra) = k.expand(&shim_name, &combos);
+        recognized_sigs.extend(sigs);
+        recognized_impls.extend(impls);
+        recognized_extra.extend(extra);
+    }
+
+    // When requested, also emit `impl SourceTrait for <shim object>` (one per
+    // marker combination) so the shim's trait object satisfies the source
+    // trait. If any method cannot be placed in that impl, every such method is
+    // reported at once and the impl is omitted, leaving the shim and blanket
+    // impl above to compile on their own rather than cascading into an
+    // "unimplemented trait items" error on generated code.
+    let reflexive_impl = match reflexive {
+        None => TokenStream2::new(),
+        Some(kind) => match build_reflexive(kind, &shim_name, source_ref, items, &combos) {
+            Ok(tokens) => tokens,
+            Err(err) => err.to_compile_error(),
+        },
+    };
+
+    quote! {
+        #clean
+
+        #(#doc_attrs)*
+        #vis trait #shim_name #supertraits {
+            #(#sigs)*
+            #recognized_sigs
+        }
+
+        impl<__T: #source_ref #impl_bounds #recognized_bounds> #shim_name for __T {
+            #(#impls)*
+            #recognized_impls
+        }
+
+        #recognized_extra
+
+        #reflexive_impl
+    }
+    .into()
+}
+
+/// Expansion for [`macro@dyn_shim_recognized`]: emit a standalone shim whose
+/// only contents are a recognized std trait's generated machinery. The
+/// annotated trait supplies the shim's name and visibility and must be a
+/// non-generic trait with no methods or supertraits of its own; the recognized
+/// trait and its auto-trait markers come from the attribute.
+fn expand_recognized(
+    input: &ItemTrait,
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+) -> TokenStream {
+    if let Some(param) = input.generics.params.first() {
+        return syn::Error::new_spanned(param, "dyn_shim_recognized does not support generic shims")
+            .to_compile_error()
+            .into();
+    }
+    if let Some(item) = input.items.first() {
+        return syn::Error::new_spanned(
+            item,
+            "a dyn_shim_recognized shim has no items of its own; its contents are generated \
+             from the recognized trait",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if let Some(supertrait) = input.supertraits.first() {
+        return syn::Error::new_spanned(
+            supertrait,
+            "list auto-trait markers in the attribute (`dyn_shim_recognized(Clone + Send)`), \
+             not as supertraits of the shim",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Exactly one recognized trait is the principal; the rest must be auto
+    // traits, which select the covered marker combinations.
+    let mut recognized = None;
+    let mut autos = Vec::new();
+    for bound in &bounds {
+        match classify(bound) {
+            Classified::Recognized(k) => {
+                if recognized.replace(k).is_some() {
+                    return syn::Error::new_spanned(
+                        bound,
+                        "expected a single recognized trait (`Clone` or `Hash`)",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
+            Classified::Auto(auto) => {
+                if !autos.contains(&auto) {
+                    autos.push(auto);
+                }
+            }
+            Classified::Rejected(_) | Classified::PassThrough => {
+                return syn::Error::new_spanned(
+                    bound,
+                    "dyn_shim_recognized expects a recognized trait (`Clone` or `Hash`), \
+                     optionally followed by auto-trait markers",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+    let Some(recognized) = recognized else {
+        return syn::Error::new_spanned(
+            &bounds,
+            "dyn_shim_recognized expects a recognized trait (`Clone` or `Hash`)",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let shim = &input.ident;
+    let vis = &input.vis;
+    let attrs = &input.attrs;
+    let combos = marker_combos(&autos);
+    let (sigs, impls, extra) = recognized.expand(shim, &combos);
+    let impl_bound = recognized.impl_bound();
+    let doc = recognized.doc_line(shim);
+
+    quote! {
+        #(#attrs)*
+        #[doc = ""]
+        #[doc = #doc]
+        #vis trait #shim {
+            #sigs
+        }
+
+        impl<__T: #impl_bound> #shim for __T {
+            #impls
+        }
+
+        #extra
+    }
+    .into()
+}
+
+/// Build the shim signature and the forwarding impl body for one method.
+///
+/// The shim method reuses the source method's entire signature (`unsafe`, ABI,
+/// generics, `where` clause, ...) and its attributes, rewriting only the
+/// inputs: a by-value `self` becomes `self: Box<Self>`, and each argument
+/// keeps its declared name where it has one. Copying the attributes keeps
+/// `#[doc]`, `#[must_use]`, and `#[deprecated]` working on the shim, and keeps
+/// a `#[cfg]`-gated method gated consistently across the source trait, the
+/// shim trait, and the blanket impl.
+///
+/// `src` is how the source trait is named in the forwarding call: its own ident
+/// for a local source trait, or a path for a foreign one.
+fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStream2) {
+    let mut sig = method.sig.clone();
+
+    let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
+        unreachable!("skip guarantees a receiver")
+    };
+    // `self: Self` is the explicit spelling of by-value `self`; only a typed
+    // receiver with a real wrapper type (Box, Rc, Arc, Pin, ...) is forwarded
+    // unchanged.
+    let by_value = recv.reference.is_none()
+        && (recv.colon_token.is_none()
+            || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self")));
+    let self_expr = if by_value {
+        // Absolute path: the expansion must not depend on what `Box` names at
+        // the call site (a local shadow, or a missing prelude under no_std).
+        sig.inputs[0] = syn::parse_quote! { self: ::std::boxed::Box<Self> };
+        quote! { *self }
+    } else {
+        quote! { self }
+    };
+
+    let mut names = Vec::new();
+    for (i, arg) in sig.inputs.iter_mut().skip(1).enumerate() {
+        let FnArg::Typed(pat) = arg else { continue };
+        // Keep the declared name; a non-trivial pattern (only legal on a
+        // defaulted method) gets a synthetic name the impl can forward.
+        let id = match &*pat.pat {
+            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
+            _ => format_ident!("__a{i}"),
+        };
+        *pat.pat = syn::parse_quote! { #id };
+        names.push(id);
+    }
+
+    let attrs: Vec<&Attribute> = method
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("dyn_shim"))
+        .collect();
+    // The impl method only takes the `cfg` gates: attributes like `#[must_use]`
+    // and `#[deprecated]` are rejected on trait methods in impl blocks (which
+    // also rules out forwarding `cfg_attr`, since it can expand to them), but a
+    // `#[cfg]`-gated method must stay gated everywhere it is emitted.
+    // `#[allow]` keeps the generated forwarding call to a `#[deprecated]`
+    // method from warning.
+    let cfg_attrs: Vec<&Attribute> = attrs
+        .iter()
+        .copied()
+        .filter(|a| a.path().is_ident("cfg"))
+        .collect();
+
+    let name = &sig.ident;
+    let shim_sig = quote! {
+        #(#attrs)*
+        #sig ;
+    };
+    let shim_impl = quote! {
+        #(#cfg_attrs)*
+        #[allow(deprecated)]
+        #sig {
+            <__T as #src>::#name(#self_expr #(, #names)*)
+        }
+    };
+    (shim_sig, shim_impl)
+}
+
+/// Build the reflexive `impl SourceTrait for <shim object>` blocks, one per
+/// marker combination. Each source method either forwards to the shim, gets a
+/// panicking stub (`#[dyn_shim(panic)]`), or is omitted to inherit a trait
+/// default body. Every method that cannot be placed is collected, so the
+/// caller reports them all in one pass.
+fn build_reflexive(
+    kind: Reflexive,
+    shim: &Ident,
+    source_ref: &TokenStream2,
+    items: &[TraitItem],
+    combos: &[MarkerCombo],
+) -> syn::Result<TokenStream2> {
+    let mut entries = Vec::new();
+    let mut errors: Option<syn::Error> = None;
+    for item in items {
+        let TraitItem::Fn(method) = item else {
+            continue;
+        };
+        match reflexive_method(kind, shim, method) {
+            Ok(Some(entry)) => entries.push(entry),
+            // A non-forwardable method with a default body is left off the
+            // impl, so calls fall back to the source trait's default.
+            Ok(None) => {}
+            Err(err) => match &mut errors {
+                Some(acc) => acc.combine(err),
+                None => errors = Some(err),
+            },
+        }
+    }
+    if let Some(err) = errors {
+        return Err(err);
+    }
+
+    let mut out = TokenStream2::new();
+    for MarkerCombo { markers, .. } in combos {
+        let self_ty = match kind {
+            Reflexive::Bare => quote! { dyn #shim #markers },
+            Reflexive::Boxed => quote! { ::std::boxed::Box<dyn #shim #markers> },
+        };
+        out.extend(quote! {
+            impl #source_ref for #self_ty {
+                #(#entries)*
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Build one method of the reflexive impl. `Ok(Some(..))` is a method to emit,
+/// `Ok(None)` omits it (a non-forwardable method with a trait default body
+/// inherits that default), and `Err` reports a method that cannot be placed in
+/// the impl at all.
+fn reflexive_method(
+    kind: Reflexive,
+    shim: &Ident,
+    method: &TraitItemFn,
+) -> syn::Result<Option<TokenStream2>> {
+    let forwardable = skip(method).is_none();
+    let stub = if forwardable {
+        false
+    } else if method.default.is_some() {
+        return Ok(None);
+    } else if helper_of(method) == Some(Helper::Panic) {
+        true
+    } else {
+        let name = &method.sig.ident;
+        let reason = skip(method).unwrap_or("not dyn-compatible");
+        return Err(syn::Error::new_spanned(
+            name,
+            format!(
+                "`{name}` is not dyn-compatible ({reason}), so the reflexive impl cannot \
+                 forward it; annotate it `#[dyn_shim(panic)]` to provide a panicking stub, \
+                 or give it a default body"
+            ),
+        ));
+    };
+
+    // `reflexive = bare` impls for the unsized `dyn` type, so an emitted method
+    // must not place `Self` by value.
+    if kind == Reflexive::Bare
+        && let Some(err) = bare_inexpressible(method)
+    {
+        return Err(err);
+    }
+
+    // The impl restates the source signature (with `Self` left intact: it
+    // resolves to the impl's self type), renaming arguments so the body can
+    // forward them. Only `#[cfg]` gates carry over, matching `forward`.
+    let mut sig = method.sig.clone();
+    let mut names = Vec::new();
+    for (i, arg) in sig.inputs.iter_mut().skip(1).enumerate() {
+        let FnArg::Typed(pat) = arg else { continue };
+        let id = match &*pat.pat {
+            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
+            _ => format_ident!("__a{i}"),
+        };
+        *pat.pat = syn::parse_quote! { #id };
+        names.push(id);
+    }
+    let cfg_attrs: Vec<&Attribute> = method
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg"))
+        .collect();
+
+    let body = if stub {
+        let msg = format!(
+            "`{}` is not available on the type-erased `{shim}` shim",
+            method.sig.ident
+        );
+        quote! { ::std::panic!(#msg) }
+    } else {
+        let name = &method.sig.ident;
+        let recv = match sig.inputs.first() {
+            Some(FnArg::Receiver(recv)) => recv,
+            _ => unreachable!("a forwarded method has a receiver"),
+        };
+        let recv_expr = reflexive_receiver(kind, recv, name)?;
+        // Dispatch through the shim trait by name, so `Self` infers to the
+        // `dyn` type (vtable dispatch to the concrete implementor). Calling the
+        // source method on `self` instead would resolve right back to this impl
+        // and recurse.
+        quote! { #shim::#name(#recv_expr #(, #names)*) }
+    };
+
+    Ok(Some(quote! {
+        #(#cfg_attrs)*
+        #[allow(deprecated)]
+        #sig { #body }
+    }))
+}
+
+/// The receiver expression passed to the shim method when forwarding through
+/// the reflexive impl. Adjusts for the impl's self type: `Box<dyn Shim>`
+/// (boxed) dereferences to reach the `dyn` type, while `dyn Shim` (bare) is
+/// already there.
+fn reflexive_receiver(
+    kind: Reflexive,
+    recv: &Receiver,
+    name: &Ident,
+) -> syn::Result<TokenStream2> {
+    let expr = match (kind, classify_receiver(recv)) {
+        // By-value `self`: boxed's self is `Box<dyn Shim>`, which is exactly the
+        // shim method's `self: Box<Self>`. (Bare never reaches here: a by-value
+        // receiver is rejected earlier as inexpressible.)
+        (_, ReceiverKind::Value) => quote! { self },
+        // `Box<Self>` source receiver: boxed's self is `Box<Box<dyn Shim>>`, so
+        // peel one box; bare's self is already `Box<dyn Shim>`.
+        (Reflexive::Boxed, ReceiverKind::Boxed) => quote! { *self },
+        (Reflexive::Bare, ReceiverKind::Boxed) => quote! { self },
+        // `&self` / `&mut self`: boxed reborrows through the box to the `dyn`
+        // type; bare's receiver already is `&dyn Shim`.
+        (Reflexive::Boxed, ReceiverKind::Ref) => quote! { &**self },
+        (Reflexive::Boxed, ReceiverKind::RefMut) => quote! { &mut **self },
+        (Reflexive::Bare, ReceiverKind::Ref | ReceiverKind::RefMut) => quote! { self },
+        (_, ReceiverKind::Other) => {
+            return Err(syn::Error::new_spanned(
+                recv,
+                format!(
+                    "`{name}`'s `self` receiver is not yet supported in a reflexive impl \
+                     (only `self`, `&self`, `&mut self`, and `self: Box<Self>` are)"
+                ),
+            ));
+        }
+    };
+    Ok(expr)
+}
+
+/// How a forwarded method's receiver is shaped, for reflexive forwarding.
+enum ReceiverKind {
+    /// By-value `self` (or the explicit `self: Self`).
+    Value,
+    /// `&self`.
+    Ref,
+    /// `&mut self`.
+    RefMut,
+    /// `self: Box<Self>`.
+    Boxed,
+    /// Any other typed receiver (`Rc<Self>`, `Arc<Self>`, `Pin<_>`, ...).
+    Other,
+}
+
+fn classify_receiver(recv: &Receiver) -> ReceiverKind {
+    if recv.reference.is_some() {
+        if recv.mutability.is_some() {
+            ReceiverKind::RefMut
+        } else {
+            ReceiverKind::Ref
+        }
+    } else if recv.colon_token.is_none()
+        || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self"))
+    {
+        ReceiverKind::Value
+    } else if is_box_self(&recv.ty) {
+        ReceiverKind::Boxed
+    } else {
+        ReceiverKind::Other
+    }
+}
+
+/// True if a type is `Box<Self>` (by any path spelling of `Box`).
+fn is_box_self(ty: &Type) -> bool {
+    let Type::Path(p) = ty else {
+        return false;
+    };
+    let Some(seg) = p.path.segments.last() else {
+        return false;
+    };
+    seg.ident == "Box"
+        && matches!(&seg.arguments, syn::PathArguments::AngleBracketed(a)
+            if a.args.iter().any(|arg|
+                matches!(arg, syn::GenericArgument::Type(Type::Path(t)) if t.path.is_ident("Self"))))
+}
+
+/// If a method cannot be expressed in a `reflexive = bare` impl (where `Self`
+/// is the unsized `dyn` shim), return the error. Such a method places `Self`
+/// by value: a by-value `self` receiver, a bare `-> Self` return, or a bare
+/// `Self` argument.
+fn bare_inexpressible(method: &TraitItemFn) -> Option<syn::Error> {
+    let sig = &method.sig;
+    let name = &sig.ident;
+
+    if let Some(FnArg::Receiver(recv)) = sig.inputs.first() {
+        let by_value = recv.reference.is_none()
+            && (recv.colon_token.is_none()
+                || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self")));
+        if by_value {
+            return Some(syn::Error::new_spanned(
+                recv,
+                format!(
+                    "`reflexive = bare` cannot include `{name}`: its by-value `self` receiver \
+                     would take the unsized `dyn` shim by value. Use `reflexive = boxed`."
+                ),
+            ));
+        }
+    }
+
+    if let ReturnType::Type(_, ty) = &sig.output
+        && is_bare_self(ty)
+    {
+        return Some(syn::Error::new_spanned(
+            ty,
+            format!(
+                "`reflexive = bare` cannot include `{name}`: it returns `Self` by value, \
+                 which is unsized as the `dyn` shim. Use `reflexive = boxed`."
+            ),
+        ));
+    }
+
+    for arg in sig.inputs.iter().skip(1) {
+        if let FnArg::Typed(pat) = arg
+            && is_bare_self(&pat.ty)
+        {
+            return Some(syn::Error::new_spanned(
+                &pat.ty,
+                format!(
+                    "`reflexive = bare` cannot include `{name}`: it takes `Self` by value, \
+                     which is unsized as the `dyn` shim. Use `reflexive = boxed`."
+                ),
+            ));
+        }
+    }
+
+    None
+}
+
+/// True if a type is exactly the bare `Self` path (not `&Self`, `Box<Self>`,
+/// or another type that merely mentions it).
+fn is_bare_self(ty: &Type) -> bool {
+    matches!(ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self"))
+}
+
+/// Build the doc-comment lines appended to the source trait, pointing readers
+/// at the generated dyn-compatible shim.
+fn source_note(shim_name: &Ident) -> Vec<String> {
+    vec![
+        String::new(),
+        "# Dyn Compatibility".to_string(),
+        String::new(),
+        format!(
+            "[`{shim_name}`] is a generated dyn-compatible shim for this trait. \
+             Use `dyn {shim_name}` to hold implementors behind a trait object."
+        ),
+    ]
+}
+
+/// Build the doc-comment lines for the generated shim trait: the capabilities
+/// added by recognized bounds, and any source methods that were skipped and
+/// why.
+fn shim_doc(
+    src: &str,
+    shim: &Ident,
+    recognized: &[RecognizedBound],
+    skipped: &[(String, &str)],
+) -> Vec<String> {
+    let mut lines = vec![format!("Dyn-compatible shim for [`{src}`].")];
+    if !recognized.is_empty() {
+        lines.push(String::new());
+        for k in recognized {
+            lines.push(k.doc_line(shim));
+        }
+    }
+    if !skipped.is_empty() {
+        lines.push(String::new());
+        lines.push("These methods of the source trait are not dyn-compatible, so they".to_string());
+        lines.push("are not part of this shim. Call them on the concrete type.".to_string());
+        lines.push(String::new());
+        for (name, reason) in skipped {
+            lines.push(format!("- [`{src}::{name}`] ({reason})"));
+        }
+    }
+    lines
+}
+
+/// A `#[dyn_shim(...)]` helper attribute on a method. `skip` and `panic` are
+/// the supported arguments.
+#[derive(Clone, Copy, PartialEq)]
+enum Helper {
+    /// `#[dyn_shim(skip)]`: leave the method off the shim entirely.
+    Skip,
+    /// `#[dyn_shim(panic)]`: when a reflexive impl is generated, give this
+    /// method a panicking stub there (for methods that cannot forward through
+    /// the shim).
+    Panic,
+}
+
+/// If a method cannot be dispatched through a trait object, return a short
+/// reason it is skipped. Return `None` when the method is forwarded.
+fn skip(method: &TraitItemFn) -> Option<&'static str> {
+    let sig = &method.sig;
+    if helper_of(method) == Some(Helper::Skip) {
+        Some("opted out with #[dyn_shim(skip)]")
+    } else if sig.asyncness.is_some() {
+        Some("async fn")
+    } else if !has_self_receiver(sig) {
+        Some("no self receiver")
+    } else if has_type_or_const_generics(sig) {
+        Some("generic type or const parameter")
+    } else if requires_self_sized(sig) {
+        Some("requires Self: Sized")
+    } else if signature_mentions_self_or_impl_trait(sig) {
+        Some("mentions Self or impl Trait")
+    } else {
+        None
+    }
+}
+
+/// Parse a method's `#[dyn_shim(...)]` attribute, which must carry exactly one
+/// of the supported arguments, `skip` or `panic`.
+fn parse_helper(attr: &Attribute) -> syn::Result<Helper> {
+    let mut helper = None;
+    attr.parse_nested_meta(|meta| {
+        let which = if meta.path.is_ident("skip") {
+            Helper::Skip
+        } else if meta.path.is_ident("panic") {
+            Helper::Panic
+        } else {
+            return Err(meta.error("unsupported dyn_shim argument, expected `skip` or `panic`"));
+        };
+        if helper.replace(which).is_some() {
+            return Err(meta.error("duplicate dyn_shim argument"));
+        }
+        Ok(())
+    })?;
+    helper.ok_or_else(|| {
+        syn::Error::new_spanned(attr, "expected #[dyn_shim(skip)] or #[dyn_shim(panic)]")
+    })
+}
+
+/// The helper argument on a method's `#[dyn_shim(...)]` attribute, if any. The
+/// arguments were validated up front, so parsing cannot fail here.
+fn helper_of(method: &TraitItemFn) -> Option<Helper> {
+    let attr = method.attrs.iter().find(|a| a.path().is_ident("dyn_shim"))?;
+    parse_helper(attr).ok()
+}
+
+/// True if the first parameter is a `self` receiver (`&self`, `&mut self`,
+/// by-value `self`, or a typed receiver such as `self: Box<Self>`).
+fn has_self_receiver(sig: &Signature) -> bool {
+    matches!(sig.inputs.first(), Some(FnArg::Receiver(_)))
+}
+
+/// True if the method's `where` clause requires `Self: Sized`. Such a method is
+/// excluded from the vtable, so it cannot be dispatched through the shim's
+/// `dyn` type even though its signature is otherwise compatible.
+fn requires_self_sized(sig: &Signature) -> bool {
+    let Some(where_clause) = &sig.generics.where_clause else {
+        return false;
+    };
+    where_clause.predicates.iter().any(|pred| {
+        let syn::WherePredicate::Type(pred) = pred else {
+            return false;
+        };
+        let Type::Path(bounded) = &pred.bounded_ty else {
+            return false;
+        };
+        if bounded.qself.is_some() || !bounded.path.is_ident("Self") {
+            return false;
+        }
+        pred.bounds
+            .iter()
+            .any(|bound| matches!(bound, syn::TypeParamBound::Trait(t) if t.path.is_ident("Sized")))
+    })
+}
+
+/// True if the method declares a generic type or const parameter. Lifetime
+/// parameters do not count, since they are forwarded as-is.
+fn has_type_or_const_generics(sig: &Signature) -> bool {
+    sig.generics
+        .params
+        .iter()
+        .any(|p| !matches!(p, GenericParam::Lifetime(_)))
+}
+
+/// True if the return type or any argument type mentions `Self` or `impl
+/// Trait`.
+fn signature_mentions_self_or_impl_trait(sig: &Signature) -> bool {
+    let return_bad =
+        matches!(&sig.output, ReturnType::Type(_, ty) if mentions_self_or_impl_trait(ty));
+
+    let arg_bad = sig
+        .inputs
+        .iter()
+        .skip(1)
+        .any(|arg| matches!(arg, FnArg::Typed(pat) if mentions_self_or_impl_trait(&pat.ty)));
+
+    return_bad || arg_bad
+}
+
+/// True if a type mentions `Self` or uses `impl Trait`, either of which makes a
+/// method non-dyn-compatible.
+fn mentions_self_or_impl_trait(ty: &Type) -> bool {
+    struct Finder(bool);
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if path.segments.iter().any(|s| s.ident == "Self") {
+                self.0 = true;
+            }
+            visit::visit_path(self, path);
+        }
+        fn visit_type_impl_trait(&mut self, it: &'ast syn::TypeImplTrait) {
+            self.0 = true;
+            visit::visit_type_impl_trait(self, it);
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_type(ty);
+    finder.0
+}

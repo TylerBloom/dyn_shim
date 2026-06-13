@@ -10,13 +10,20 @@ readme = "README.md"
 keywords = ["dyn-compatible", "dyn-safe", "trait", "proc-macro", "macro"]
 categories = ["rust-patterns"]
 
-[lib]
-proc-macro = true
+[workspace]
+members = ["dyn_shim_macros"]
+
+[features]
+default = []
+# Provide `DynClone`, a standalone dyn-compatible shim for `Clone`, and make a
+# recognized `Clone` bound add `DynClone` as a supertrait of the shim.
+dyn_clone = ["dyn_shim_macros/dyn_clone"]
+# Provide `DynHash`, a standalone dyn-compatible shim for `Hash`, and make a
+# recognized `Hash` bound add `DynHash` as a supertrait of the shim.
+dyn_hash = ["dyn_shim_macros/dyn_hash"]
 
 [dependencies]
-syn = { version = "2", features = ["full", "visit"] }
-quote = "1"
-proc-macro2 = "1"
+dyn_shim_macros = { version = "0.2.0", path = "dyn_shim_macros" }
 
 [dev-dependencies]
 trybuild = "1.0"

@@ -1,0 +1,32 @@
+[package]
+name = "dyn_shim_macros"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Proc-macro implementation for the dyn_shim crate"
+repository = "https://github.com/nixpulvis/dyn_shim"
+documentation = "https://docs.rs/dyn_shim"
+
+[lib]
+proc-macro = true
+
+# Forwarded from `dyn_shim`'s `dyn_clone`/`dyn_hash` features. When on, a recognized
+# `Clone`/`Hash` bound additionally adds `::dyn_shim::DynClone`/`DynHash` as a
+# supertrait of the generated shim, so the shim's `dyn` type upcasts into the
+# standalone one. Off: the recognized bound stays self-contained.
+[features]
+dyn_clone = []
+dyn_hash = []
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+proc-macro2 = "1"
+
+# Doc examples are written against the `dyn_shim` facade (`use dyn_shim::...`),
+# so the rendered docs match what downstream users write. A dev-dependency
+# cycle is fine: it only affects this crate's tests and doctests, not its build.
+# The features are enabled so doc examples that emit `::dyn_shim::DynClone`
+# references (when this crate's matching feature is on) resolve.
+[dev-dependencies]
+dyn_shim = { path = "..", features = ["dyn_clone", "dyn_hash"] }

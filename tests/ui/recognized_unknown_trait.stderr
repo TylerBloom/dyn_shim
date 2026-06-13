@@ -1,0 +1,5 @@
+error: dyn_shim_recognized expects a recognized trait (`Clone` or `Hash`), optionally followed by auto-trait markers
+ --> tests/ui/recognized_unknown_trait.rs:5:23
+  |
+5 | #[dyn_shim_recognized(Debug)]
+  |                       ^^^^^

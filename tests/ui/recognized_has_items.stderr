@@ -1,0 +1,5 @@
+error: a dyn_shim_recognized shim has no items of its own; its contents are generated from the recognized trait
+ --> tests/ui/recognized_has_items.rs:7:5
+  |
+7 |     fn extra(&self) -> i32;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^

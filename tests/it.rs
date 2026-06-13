@@ -2,7 +2,7 @@
 // purpose, to exercise lifetime forwarding.
 #![allow(clippy::needless_lifetimes)]
 
-use dyn_shim::{dyn_shim, dyn_shim_foreign};
+use dyn_shim::{dyn_shim, dyn_shim_foreign, dyn_shim_recognized};
 use std::fmt::Display;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -751,4 +751,125 @@ fn foreign_reflexive_satisfies_source() {
     let b: Box<dyn DynBrew> = Box::new(Cup(4));
     assert_eq!(taste(&b), 4);
     assert_eq!(drink(b), 5);
+}
+
+// `dyn_shim_recognized(Clone)` exposes std `Clone` as a standalone
+// dyn-compatible shim, the way the `dyn_clone` crate's `DynClone` does:
+// `impl<T: Clone> DynCloneable for T` is generated, and `Box<dyn DynCloneable>`
+// is itself `Clone`, cloning the underlying concrete value. The listed `Send`
+// marker covers the `+ Send` variant too.
+#[dyn_shim_recognized(Clone + Send)]
+trait DynCloneable {}
+
+static CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct Tracked;
+impl Clone for Tracked {
+    fn clone(&self) -> Self {
+        CLONES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Tracked
+    }
+}
+
+#[test]
+fn recognized_clone_standalone() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let a: Box<dyn DynCloneable> = Box::new(Tracked);
+    let before = CLONES.load(SeqCst);
+    let _b = a.clone(); // Box<dyn DynCloneable>: Clone -> Tracked::clone
+    assert_eq!(CLONES.load(SeqCst), before + 1);
+
+    // The `+ Send` marker variant is cloneable and crosses thread boundaries.
+    let s: Box<dyn DynCloneable + Send> = Box::new(Tracked);
+    let s2 = s.clone();
+    std::thread::spawn(move || drop(s2)).join().unwrap();
+
+    // `dyn DynCloneable` gets `ToOwned`, so a borrow can escape as an owned box.
+    let owned: Box<dyn DynCloneable> = (*a).to_owned();
+    drop(owned);
+}
+
+// `dyn_shim_recognized(Hash)` exposes std `Hash`: `dyn DynHashable` implements
+// `Hash`, hashing like the underlying concrete value, and through std's
+// forwarding impl so does `Box<dyn DynHashable>`.
+#[dyn_shim_recognized(Hash)]
+trait DynHashable {}
+
+#[test]
+fn recognized_hash_standalone() {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let bh = BuildHasherDefault::<DefaultHasher>::default();
+
+    let boxed: Box<dyn DynHashable> = Box::new(42u32);
+    let by_ref: &dyn DynHashable = &42u32;
+    let expected = bh.hash_one(42u32);
+    assert_eq!(bh.hash_one(&*boxed), expected);
+    assert_eq!(bh.hash_one(by_ref), expected);
+    // Different values hash differently.
+    assert_ne!(bh.hash_one(by_ref), bh.hash_one(7u32));
+}
+
+// The crate's ready-made `DynClone` shim (behind the `dyn_clone` feature): a boxed
+// trait object is cloneable, the marker variants are covered, and a borrow can
+// escape as an owned box through `ToOwned`.
+#[cfg(feature = "dyn_clone")]
+#[test]
+fn shipped_dyn_clone() {
+    use dyn_shim::DynClone;
+
+    #[derive(Clone)]
+    struct Widget;
+
+    let a: Box<dyn DynClone + Send + Sync> = Box::new(Widget);
+    let b = a.clone();
+    std::thread::spawn(move || drop(b)).join().unwrap();
+
+    let r: &dyn DynClone = &Widget;
+    let owned: Box<dyn DynClone> = r.to_owned();
+    drop(owned);
+}
+
+// With the `dyn_clone` feature on, a recognized `Clone` bound makes the shim a
+// subtrait of the standalone `DynClone`, so its boxed trait object upcasts to
+// `Box<dyn DynClone>` and flows into DynClone-typed APIs, while still cloning
+// as its own `Box<dyn DynSticker>`.
+#[cfg(feature = "dyn_clone")]
+#[test]
+fn clone_bound_shim_upcasts_to_dyn_clone() {
+    fn keep(_: Box<dyn dyn_shim::DynClone>) {}
+
+    let a: Box<dyn DynSticker> = Box::new(Tag("a".into()));
+    let copy = a.clone(); // still clones as Box<dyn DynSticker>
+    assert_eq!(copy.label(), "a");
+
+    let erased: Box<dyn dyn_shim::DynClone> = a; // trait upcast
+    keep(erased.clone());
+}
+
+// The crate's ready-made `DynHash` shim (behind the `dyn_hash` feature): the boxed
+// trait object hashes like the underlying concrete value.
+#[cfg(feature = "dyn_hash")]
+#[test]
+fn shipped_dyn_hash() {
+    use dyn_shim::DynHash;
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+    let bh = BuildHasherDefault::<DefaultHasher>::default();
+    let boxed: Box<dyn DynHash> = Box::new(99u32);
+    assert_eq!(bh.hash_one(&*boxed), bh.hash_one(99u32));
+}
+
+// With the `dyn_hash` feature on, a recognized `Hash` bound makes the shim a
+// subtrait of the standalone `DynHash`, so its trait object upcasts to
+// `&dyn DynHash` and hashes like the concrete value.
+#[cfg(feature = "dyn_hash")]
+#[test]
+fn hash_bound_shim_upcasts_to_dyn_hash() {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+    let bh = BuildHasherDefault::<DefaultHasher>::default();
+    let color: &dyn DynColor = &Red;
+    let erased: &dyn dyn_shim::DynHash = color; // trait upcast
+    assert_eq!(bh.hash_one(erased), bh.hash_one(&Red));
 }

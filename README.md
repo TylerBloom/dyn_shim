@@ -52,6 +52,36 @@ trait Shape {
 // Box<dyn DynShape> and Box<dyn DynShape + Send> implement Clone.
 ```
 
+## Reflexive impls
+
+By default the shim is a separate trait, so a `Box<dyn DynFoo>` is not a `Foo`.
+Adding `reflexive = boxed` also generates `impl Foo for Box<dyn DynFoo>`, so the
+boxed trait object satisfies the source trait itself and can be passed to code
+written against `Foo`. Methods that cannot be dispatched through the shim (a
+constructor, a generic method) are opted into a panicking stub with
+`#[dyn_shim(panic)]`:
+
+```rust
+use dyn_shim::dyn_shim;
+
+#[dyn_shim(DynMunch, reflexive = boxed)]
+trait Munch {
+    fn crunch(self) -> u32;
+    #[dyn_shim(panic)]
+    fn fresh() -> Self; // not dispatchable: panics if called on the box
+}
+
+fn eat(m: impl Munch) -> u32 {
+    m.crunch()
+}
+
+// Box<dyn DynMunch> is a Munch, so it can be passed to `eat`.
+```
+
+`reflexive = bare` instead generates `impl Foo for dyn DynFoo`, so a `&dyn
+DynFoo` satisfies `Foo` by reference. It cannot express a by-value `self` or a
+`-> Self`, since `dyn DynFoo` is unsized; use `reflexive = boxed` for those.
+
 ## Foreign traits
 
 `#[dyn_shim]` has to sit on the trait's own definition, so it cannot target a
@@ -74,6 +104,30 @@ trait DynSink: Clone {
 
 // Box<dyn DynSink> holds any Clone implementor of other_crate::Sink.
 ```
+
+The `reflexive` option and `#[dyn_shim(panic)]` work on the foreign form too.
+
+## Features
+
+`Clone` and `Hash` cannot be supertraits of a dyn-compatible trait, so this
+crate ships their shims directly, each behind a feature:
+
+```toml
+[dependencies]
+dyn_shim = { version = "0.2", features = ["dyn_clone", "dyn_hash"] }
+```
+
+- `dyn_clone` provides `DynClone`: `Box<dyn DynClone>` implements `Clone` and `dyn
+  DynClone` implements `ToOwned`. It is a drop-in for the `dyn-clone` crate's
+  `DynClone`.
+- `dyn_hash` provides `DynHash`: `dyn DynHash` implements `Hash` (covering `Box<dyn
+  DynHash>` through the standard library's forwarding impl). It mirrors the
+  `dyn-hash` crate.
+
+With a feature on, a recognized `Clone`/`Hash` bound also makes the shim a
+subtrait of `DynClone`/`DynHash`, so `Box<dyn DynFoo>` (or `&dyn DynFoo`)
+upcasts to `Box<dyn DynClone>` (or `&dyn DynHash`) and flows into APIs typed
+against those.
 
 See the [API documentation](https://docs.rs/dyn_shim) for details.
 
