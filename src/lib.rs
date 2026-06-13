@@ -12,13 +12,13 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, ReturnType, Signature, Token, TraitItem,
-    TraitItemFn, Type, TypeParamBound, parse_macro_input,
+    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, ReturnType, Signature, Token,
+    TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
 };
 
 /// Arguments to [`macro@dyn_shim`]: the shim trait's name, optionally followed
@@ -700,12 +700,132 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
     let Args { shim_name, bounds } = parse_macro_input!(attr as Args);
     let input = parse_macro_input!(item as ItemTrait);
+    // The source trait is local: refer to it by its own name, and re-emit it.
+    let source_ref = input.ident.to_token_stream();
+    let source_doc = input.ident.to_string();
+    expand(shim_name, bounds, &input, &source_ref, &source_doc, true)
+}
 
+/// Generate a dyn-compatible shim for a trait defined in another crate.
+///
+/// `#[dyn_shim]` must sit on the trait's own definition, so it cannot target a
+/// trait you do not own. This attribute fills that gap. Its sole argument is the
+/// path to the foreign source trait, and the trait it is written on *is* the
+/// shim: its name names the shim, its supertrait list supplies the bounds, and
+/// its body restates the methods to forward.
+///
+/// ```
+/// use dyn_shim::dyn_shim_foreign;
+///
+/// // Stands in for a trait defined in a dependency.
+/// mod other_crate {
+///     pub trait Sink {
+///         fn write(&mut self, line: &str);
+///         fn total(&self) -> usize;
+///         fn finish(self) -> usize;
+///     }
+/// }
+///
+/// #[dyn_shim_foreign(other_crate::Sink)]
+/// trait DynSink {
+///     fn write(&mut self, line: &str);
+///     fn total(&self) -> usize;
+///     fn finish(self) -> usize; // by-value -> self: Box<Self>
+/// }
+///
+/// struct Buf(usize);
+/// impl other_crate::Sink for Buf {
+///     fn write(&mut self, _line: &str) { self.0 += 1; }
+///     fn total(&self) -> usize { self.0 }
+///     fn finish(self) -> usize { self.0 }
+/// }
+///
+/// let mut s: Box<dyn DynSink> = Box::new(Buf(0));
+/// s.write("a");
+/// assert_eq!(s.total(), 1);
+/// assert_eq!(s.finish(), 1);
+/// ```
+///
+/// # How It Differs From [`macro@dyn_shim`]
+///
+/// `#[dyn_shim]` reads a source trait and emits a *second*, shim trait beside
+/// it. `#[dyn_shim_foreign]` has no source trait to read — it lives in another
+/// crate — so the annotated trait is the shim directly: it is consumed and
+/// re-emitted with the forwarding machinery filled in, rather than copied. The
+/// blanket impl forwards to the foreign path
+/// (`impl<T: other_crate::Sink> DynSink for T`), which coherence permits: the
+/// shim trait is local, so a blanket impl of it is allowed however foreign the
+/// source trait is, and the recognized-bound machinery lands on the local
+/// `dyn` types. The shim's name, visibility, supertrait list, and method
+/// selection all read off the annotated trait, so [method selection], [bounds],
+/// and [recognized bounds] work exactly as for [`macro@dyn_shim`] — a `Clone`
+/// or `Hash` in the supertrait list is recognized, auto traits pass through and
+/// select marker combinations, and so on.
+///
+/// One thing follows from the source trait being foreign: **the signatures must
+/// be restated by hand.** A proc macro sees only its own input tokens, never
+/// another crate's AST, so it cannot read the foreign trait's methods. List the
+/// dyn-compatible ones you want forwarded; omit the rest (a receiverless
+/// `fn build() -> Self` simply has no place in the shim anyway). A restated
+/// signature that does not match the real one is caught when the generated
+/// `<T as other_crate::Sink>::method(..)` call fails to compile.
+///
+/// [method selection]: macro@dyn_shim#method-selection
+/// [bounds]: macro@dyn_shim#bounds
+/// [recognized bounds]: macro@dyn_shim#recognized-bounds
+#[proc_macro_attribute]
+pub fn dyn_shim_foreign(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // The only argument is the foreign source trait's path; everything else is
+    // read off the annotated trait, which is itself the shim.
+    let source = parse_macro_input!(attr as Path);
+    let input = parse_macro_input!(item as ItemTrait);
+    let source_ref = source.to_token_stream();
+    let source_doc = path_doc_string(&source);
+    // No source trait to re-emit: the annotated trait is the shim, regenerated
+    // from its own name, supertraits, and restated signatures.
+    let shim_name = input.ident.clone();
+    let bounds = input.supertraits.clone();
+    expand(shim_name, bounds, &input, &source_ref, &source_doc, false)
+}
+
+/// Render a path as `a::b::C` for doc links, dropping any generic arguments.
+fn path_doc_string(path: &Path) -> String {
+    let mut out = String::new();
+    if path.leading_colon.is_some() {
+        out.push_str("::");
+    }
+    for (i, segment) in path.segments.iter().enumerate() {
+        if i > 0 {
+            out.push_str("::");
+        }
+        out.push_str(&segment.ident.to_string());
+    }
+    out
+}
+
+/// Shared expansion for both attributes. `input` is the annotated trait, read
+/// for the shim's visibility, generics, and method signatures (and, for the
+/// local form, re-emitted). `source_ref` is how the source trait is named in
+/// the blanket impl and the forwarding calls (an ident for the local form, a
+/// path for the foreign one); `source_doc` is its `::`-joined spelling for doc
+/// links. `reemit` is `true` for the local form, which owns the source trait
+/// and re-emits it with a dyn-compat doc note, and `false` for the foreign
+/// form, whose annotated trait is the shim itself.
+fn expand(
+    shim_name: Ident,
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+    input: &ItemTrait,
+    source_ref: &TokenStream2,
+    source_doc: &str,
+    reemit: bool,
+) -> TokenStream {
     if let Some(param) = input.generics.params.first() {
         return syn::Error::new_spanned(param, "dyn_shim does not support generic source traits")
             .to_compile_error()
             .into();
     }
+    let vis = &input.vis;
+    let items = &input.items;
 
     // Partition the bounds list. A recognized std trait (`Clone`, `Hash`) is
     // drained: as a supertrait it would break dyn-compatibility, so it
@@ -752,7 +872,7 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
     // rejected outright. Only methods are stripped of it before the trait is
     // re-emitted, so left in place rustc would re-expand it as this attribute
     // macro and fail with an unrelated parse error pointing at the item.
-    for item in &input.items {
+    for item in items {
         let attrs = match item {
             TraitItem::Fn(item) => {
                 for attr in item.attrs.iter().filter(|a| a.path().is_ident("dyn_shim")) {
@@ -777,39 +897,41 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    let src = &input.ident;
-    let vis = &input.vis;
-
     let mut sigs = Vec::new();
     let mut impls = Vec::new();
     let mut skipped: Vec<(String, &str)> = Vec::new();
-    for item in &input.items {
+    for item in items {
         let TraitItem::Fn(method) = item else {
             continue;
         };
         match skip(method) {
             Some(reason) => skipped.push((method.sig.ident.to_string(), reason)),
             None => {
-                let (sig, body) = forward(method, src);
+                let (sig, body) = forward(method, source_ref);
                 sigs.push(sig);
                 impls.push(body);
             }
         }
     }
 
-    // Re-emit the source trait without our `#[dyn_shim(skip)]` helper
-    // attributes, and point its docs at the generated shim.
-    let mut clean = input.clone();
-    for item in &mut clean.items {
-        if let TraitItem::Fn(method) = item {
-            method.attrs.retain(|a| !a.path().is_ident("dyn_shim"));
+    // Re-emit the source trait (local form only) without our
+    // `#[dyn_shim(skip)]` helper attributes, and point its docs at the
+    // generated shim. The foreign form reads only the signatures above and
+    // emits nothing for the annotated trait.
+    let clean = reemit.then(|| {
+        let mut clean = input.clone();
+        for item in &mut clean.items {
+            if let TraitItem::Fn(method) = item {
+                method.attrs.retain(|a| !a.path().is_ident("dyn_shim"));
+            }
         }
-    }
-    for line in source_doc(&shim_name) {
-        clean.attrs.push(syn::parse_quote! { #[doc = #line] });
-    }
+        for line in source_note(&shim_name) {
+            clean.attrs.push(syn::parse_quote! { #[doc = #line] });
+        }
+        clean
+    });
 
-    let doc_attrs = shim_doc(src, &shim_name, &recognized, &skipped)
+    let doc_attrs = shim_doc(source_doc, &shim_name, &recognized, &skipped)
         .into_iter()
         .map(|line| quote! { #[doc = #line] });
 
@@ -845,7 +967,7 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
             #recognized_sigs
         }
 
-        impl<__T: #src #impl_bounds #recognized_bounds> #shim_name for __T {
+        impl<__T: #source_ref #impl_bounds #recognized_bounds> #shim_name for __T {
             #(#impls)*
             #recognized_impls
         }
@@ -864,7 +986,10 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[doc]`, `#[must_use]`, and `#[deprecated]` working on the shim, and keeps
 /// a `#[cfg]`-gated method gated consistently across the source trait, the
 /// shim trait, and the blanket impl.
-fn forward(method: &TraitItemFn, src: &Ident) -> (TokenStream2, TokenStream2) {
+///
+/// `src` is how the source trait is named in the forwarding call: its own ident
+/// for a local source trait, or a path for a foreign one.
+fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStream2) {
     let mut sig = method.sig.clone();
 
     let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
@@ -932,7 +1057,7 @@ fn forward(method: &TraitItemFn, src: &Ident) -> (TokenStream2, TokenStream2) {
 
 /// Build the doc-comment lines appended to the source trait, pointing readers
 /// at the generated dyn-compatible shim.
-fn source_doc(shim_name: &Ident) -> Vec<String> {
+fn source_note(shim_name: &Ident) -> Vec<String> {
     vec![
         String::new(),
         "# Dyn Compatibility".to_string(),
@@ -948,7 +1073,7 @@ fn source_doc(shim_name: &Ident) -> Vec<String> {
 /// added by recognized bounds, and any source methods that were skipped and
 /// why.
 fn shim_doc(
-    src: &Ident,
+    src: &str,
     shim: &Ident,
     recognized: &[RecognizedBound],
     skipped: &[(String, &str)],

@@ -2,7 +2,7 @@
 // purpose, to exercise lifetime forwarding.
 #![allow(clippy::needless_lifetimes)]
 
-use dyn_shim::dyn_shim;
+use dyn_shim::{dyn_shim, dyn_shim_foreign};
 use std::fmt::Display;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -543,4 +543,87 @@ fn assoc_type_bound_binds_at_use_site() {
     assert_eq!(source.label(), "ramp");
     let head: Vec<u8> = source.by_ref().take(3).collect();
     assert_eq!(head, [1, 2, 3]);
+}
+
+// `#[dyn_shim_foreign]` shims a trait the annotating crate does not own. The
+// module here stands in for a dependency: the macro cannot read its body, so
+// the annotated trait restates the signatures to forward (and is itself
+// discarded, not re-emitted). The blanket impl forwards to the foreign path.
+mod thirdparty {
+    #[allow(dead_code)]
+    pub trait Channel {
+        fn connect() -> Self; // receiverless; not restated below
+        fn label(&self) -> String;
+        fn deliver(&mut self, message: &str) -> usize;
+        fn close(self) -> usize; // by-value self
+    }
+}
+
+struct Email(usize);
+impl thirdparty::Channel for Email {
+    fn connect() -> Self {
+        Email(0)
+    }
+    fn label(&self) -> String {
+        "email".into()
+    }
+    fn deliver(&mut self, _message: &str) -> usize {
+        self.0 += 1;
+        self.0
+    }
+    fn close(self) -> usize {
+        self.0
+    }
+}
+
+// The annotated trait is the shim; only the dyn-compatible methods to forward
+// are listed (the receiverless `connect` is omitted). The foreign trait's path
+// is the attribute argument.
+#[dyn_shim_foreign(thirdparty::Channel)]
+trait DynChannel {
+    fn label(&self) -> String;
+    fn deliver(&mut self, message: &str) -> usize;
+    fn close(self) -> usize; // by-value -> self: Box<Self>
+}
+
+#[test]
+fn foreign_trait_shimmed() {
+    let mut ch: Box<dyn DynChannel> = Box::new(Email(0));
+    assert_eq!(ch.label(), "email");
+    assert_eq!(ch.deliver("hi"), 1);
+    assert_eq!(ch.deliver("again"), 2);
+    assert_eq!(ch.close(), 2); // by-value self forwarded through Box<Self>
+}
+
+// Recognized bounds, marker combinations, and supertraits work through the
+// foreign form exactly as the local one: `Clone` makes the boxed trait
+// objects cloneable, `Send` selects the marker variant, and a path to the
+// foreign trait carrying generic arguments is forwarded verbatim.
+mod widgets {
+    pub trait Paint<C> {
+        fn color(&self) -> C;
+    }
+}
+
+#[derive(Clone)]
+struct Square;
+impl widgets::Paint<u8> for Square {
+    fn color(&self) -> u8 {
+        7
+    }
+}
+
+#[dyn_shim_foreign(widgets::Paint<u8>)]
+trait DynPaint: Clone + Send {
+    fn color(&self) -> u8;
+}
+
+#[test]
+fn foreign_recognized_bound_and_markers() {
+    let plain: Box<dyn DynPaint> = Box::new(Square);
+    assert_eq!(plain.clone().color(), 7);
+
+    let send: Box<dyn DynPaint + Send> = Box::new(Square);
+    let copy = send.clone();
+    assert_eq!(std::thread::spawn(move || copy.color()).join().unwrap(), 7);
 }

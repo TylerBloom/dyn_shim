@@ -52,6 +52,29 @@ trait Shape {
 // Box<dyn DynShape> and Box<dyn DynShape + Send> implement Clone.
 ```
 
+## Foreign traits
+
+`#[dyn_shim]` has to sit on the trait's own definition, so it cannot target a
+trait from a dependency. `#[dyn_shim_foreign(path)]` does: the annotated trait
+*is* the shim, restating the foreign methods to forward, and the macro fills in
+the forwarding machinery plus a blanket impl pointing at the foreign path. Its
+name, visibility, and supertrait list work just like `#[dyn_shim]`'s. A proc
+macro cannot see another crate's trait body, so the signatures must be restated
+by hand; a mismatch is caught when the generated forwarding call fails to
+compile.
+
+```rust
+use dyn_shim::dyn_shim_foreign;
+
+#[dyn_shim_foreign(other_crate::Sink)]
+trait DynSink: Clone {
+    fn write(&mut self, line: &str);
+    fn finish(self) -> usize;
+}
+
+// Box<dyn DynSink> holds any Clone implementor of other_crate::Sink.
+```
+
 See the [API documentation](https://docs.rs/dyn_shim) for details.
 
 ## Testing

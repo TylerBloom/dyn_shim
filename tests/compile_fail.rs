@@ -26,6 +26,7 @@ fn invalid_helper_attrs_rejected() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/attr_non_method.rs");
     t.compile_fail("tests/ui/attr_unknown_arg.rs");
+    t.compile_fail("tests/ui/foreign_missing_path.rs");
 }
 
 // A recognized bound (`Clone`, `Hash`) constrains the blanket impl, so an
