@@ -1,0 +1,5 @@
+error: `reflexive = bare` cannot include `consume`: its by-value `self` receiver would take the unsized `dyn` shim by value. Use `reflexive = boxed`.
+ --> tests/ui/reflexive_both_bare_by_value.rs:9:16
+  |
+9 |     fn consume(self) -> i32;
+  |                ^^^^

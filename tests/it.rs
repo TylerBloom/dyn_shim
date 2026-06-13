@@ -712,6 +712,34 @@ fn reflexive_bare_satisfies_by_ref() {
     assert_eq!(measure(d), 16);
 }
 
+// `reflexive = bare + boxed` emits both impls, so a borrow (`&dyn DynGreeter`)
+// and an owned box (`Box<dyn DynGreeter>`) each satisfy the source trait.
+#[dyn_shim(DynGreeter, reflexive = bare + boxed)]
+trait Greeter {
+    fn greet(&self) -> String;
+}
+
+struct Hi;
+impl Greeter for Hi {
+    fn greet(&self) -> String {
+        "hi".into()
+    }
+}
+
+fn by_ref<T: Greeter + ?Sized>(g: &T) -> String {
+    g.greet()
+}
+fn by_val(g: impl Greeter) -> String {
+    g.greet()
+}
+
+#[test]
+fn reflexive_both_satisfies_ref_and_box() {
+    let b: Box<dyn DynGreeter> = Box::new(Hi);
+    assert_eq!(by_ref(&*b), "hi"); // &dyn DynGreeter: Greeter (bare)
+    assert_eq!(by_val(b), "hi"); // Box<dyn DynGreeter>: Greeter (boxed)
+}
+
 // `reflexive` works through the foreign form too: a `Box<dyn DynBrew>` is made
 // to satisfy the foreign `cafe::Brew`, so it can be handed to code in (or
 // generic over) the dependency that expects `impl Brew`, including the

@@ -76,6 +76,7 @@ fn unlisted_marker_not_covered() {
 fn reflexive_impl_must_be_complete() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/reflexive_bare_by_value.rs");
+    t.compile_fail("tests/ui/reflexive_both_bare_by_value.rs");
     t.compile_fail("tests/ui/reflexive_unstubbed_method.rs");
     t.compile_fail("tests/ui/reflexive_unstubbed_multiple.rs");
 }

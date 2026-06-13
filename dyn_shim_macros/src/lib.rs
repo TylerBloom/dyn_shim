@@ -19,12 +19,12 @@ use syn::{
     Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
 };
 
-/// Which reflexive `impl SourceTrait for <shim object>` the macro emits in
-/// addition to the blanket `impl<T: SourceTrait> Shim for T`, so the shim's
-/// trait object satisfies the source trait itself. Selected with
-/// `reflexive = bare` or `reflexive = boxed` in the attribute.
+/// A reflexive `impl SourceTrait for <shim object>` the macro emits in addition
+/// to the blanket `impl<T: SourceTrait> Shim for T`, so the shim's trait object
+/// satisfies the source trait itself. Selected with `reflexive = bare`,
+/// `reflexive = boxed`, or `reflexive = bare + boxed` (both) in the attribute.
 #[derive(Clone, Copy, PartialEq)]
-enum Reflexive {
+enum ReflexiveKind {
     /// `impl SourceTrait for dyn Shim`. `Self` is the unsized `dyn` type, so a
     /// by-value `self` receiver or a by-value `Self` in the signature cannot be
     /// expressed.
@@ -34,27 +34,15 @@ enum Reflexive {
     Boxed,
 }
 
-impl Parse for Reflexive {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let kind: Ident = input.parse()?;
-        match kind.to_string().as_str() {
-            "bare" => Ok(Reflexive::Bare),
-            "boxed" => Ok(Reflexive::Boxed),
-            _ => Err(syn::Error::new_spanned(
-                kind,
-                "unsupported reflexive kind, expected `bare` or `boxed`",
-            )),
-        }
-    }
-}
-
-/// Parse an optional trailing `, reflexive = <kind>` from an attribute's
-/// argument list, after whatever each attribute reads first (the shim name and
-/// bounds for [`macro@dyn_shim`], the source path for
-/// [`macro@dyn_shim_foreign`]).
-fn parse_reflexive(input: ParseStream) -> syn::Result<Option<Reflexive>> {
+/// Parse an optional trailing `, reflexive = <kinds>` from an attribute's
+/// argument list, where `<kinds>` is one or more of `bare` and `boxed` joined
+/// with `+`; `reflexive = bare + boxed` emits both impls. Returns the requested
+/// kinds, deduplicated, and empty when no `reflexive` argument is present. The
+/// argument comes after whatever each attribute reads first (the shim name and
+/// bounds for [`macro@dyn_shim`], the source path for [`macro@dyn_shim_foreign`]).
+fn parse_reflexive(input: ParseStream) -> syn::Result<Vec<ReflexiveKind>> {
     if !input.peek(Token![,]) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     input.parse::<Token![,]>()?;
     let key: Ident = input.parse()?;
@@ -62,16 +50,32 @@ fn parse_reflexive(input: ParseStream) -> syn::Result<Option<Reflexive>> {
         return Err(syn::Error::new_spanned(key, "expected `reflexive`"));
     }
     input.parse::<Token![=]>()?;
-    Ok(Some(input.parse()?))
+    let mut kinds = Vec::new();
+    for ident in Punctuated::<Ident, Token![+]>::parse_separated_nonempty(input)? {
+        let kind = match ident.to_string().as_str() {
+            "bare" => ReflexiveKind::Bare,
+            "boxed" => ReflexiveKind::Boxed,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    ident,
+                    "unsupported reflexive kind, expected `bare` or `boxed`",
+                ));
+            }
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    Ok(kinds)
 }
 
 /// Arguments to [`macro@dyn_shim`]: the shim trait's name, optionally followed
 /// by supertraits to put on it, written like a trait's supertrait list
-/// (`DynFoo: Send + Sync`), and an optional `, reflexive = bare | boxed`.
+/// (`DynFoo: Send + Sync`), and an optional `, reflexive = bare | boxed | bare + boxed`.
 struct Args {
     shim_name: Ident,
     bounds: Punctuated<TypeParamBound, Token![+]>,
-    reflexive: Option<Reflexive>,
+    reflexive: Vec<ReflexiveKind>,
 }
 
 impl Parse for Args {
@@ -92,10 +96,10 @@ impl Parse for Args {
 }
 
 /// Arguments to [`macro@dyn_shim_foreign`]: the path to the foreign source
-/// trait, and an optional `, reflexive = bare | boxed`.
+/// trait, and an optional `, reflexive = bare | boxed | bare + boxed`.
 struct ForeignArgs {
     source: Path,
-    reflexive: Option<Reflexive>,
+    reflexive: Vec<ReflexiveKind>,
 }
 
 impl Parse for ForeignArgs {
@@ -492,6 +496,13 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 ///   stand in for an `&impl Foo`. `Self` is the unsized `dyn DynFoo`, so a
 ///   by-value `self` receiver, a `-> Self`, or a by-value `Self` argument cannot
 ///   be expressed; use `reflexive = boxed` for a trait that has those.
+/// - `reflexive = bare + boxed` emits both impls, so a borrow *and* an owned box
+///   satisfy `Foo`. It is only available when the bare impl is (no by-value
+///   `Self`); otherwise the macro rejects it toward `boxed`.
+///
+/// The two kinds are complementary: a `bare` impl gives `&dyn DynFoo: Foo`, and
+/// a `boxed` impl gives `Box<dyn DynFoo>: Foo`. Neither implies the other for a
+/// general trait, so request both when the erased value is consumed both ways.
 ///
 /// The impl must account for every method of the source trait. A dyn-compatible
 /// method forwards through the shim. A method that is not dyn-compatible (see
@@ -1050,7 +1061,7 @@ fn expand(
     source_ref: &TokenStream2,
     source_doc: &str,
     reemit: bool,
-    reflexive: Option<Reflexive>,
+    reflexive: Vec<ReflexiveKind>,
 ) -> TokenStream {
     if let Some(param) = input.generics.params.first() {
         return syn::Error::new_spanned(param, "dyn_shim does not support generic source traits")
@@ -1095,7 +1106,7 @@ fn expand(
     // The marker combinations feed the recognized-bound machinery and the
     // reflexive impl (one per `dyn Shim + markers` variant), so there is
     // nothing to compute when neither is present.
-    let combos = if recognized.is_empty() && reflexive.is_none() {
+    let combos = if recognized.is_empty() && reflexive.is_empty() {
         Vec::new()
     } else {
         marker_combos(&autos)
@@ -1202,18 +1213,29 @@ fn expand(
         recognized_extra.extend(extra);
     }
 
-    // When requested, also emit `impl SourceTrait for <shim object>` (one per
-    // marker combination) so the shim's trait object satisfies the source
-    // trait. If any method cannot be placed in that impl, every such method is
-    // reported at once and the impl is omitted, leaving the shim and blanket
-    // impl above to compile on their own rather than cascading into an
-    // "unimplemented trait items" error on generated code.
-    let reflexive_impl = match reflexive {
-        None => TokenStream2::new(),
-        Some(kind) => match build_reflexive(kind, &shim_name, source_ref, items, &combos) {
-            Ok(tokens) => tokens,
-            Err(err) => err.to_compile_error(),
-        },
+    // When requested, also emit `impl SourceTrait for <shim object>` for each
+    // requested kind (and each marker combination), so the shim's trait object
+    // satisfies the source trait. If any method cannot be placed in a requested
+    // impl, every such method is reported at once and the reflexive impls are
+    // omitted, leaving the shim and blanket impl above to compile on their own
+    // rather than cascading into an "unimplemented trait items" error on
+    // generated code.
+    let reflexive_impl = {
+        let mut tokens = TokenStream2::new();
+        let mut errors: Option<syn::Error> = None;
+        for kind in reflexive {
+            match build_reflexive(kind, &shim_name, source_ref, items, &combos) {
+                Ok(impls) => tokens.extend(impls),
+                Err(err) => match &mut errors {
+                    Some(acc) => acc.combine(err),
+                    None => errors = Some(err),
+                },
+            }
+        }
+        match errors {
+            Some(err) => err.to_compile_error(),
+            None => tokens,
+        }
     };
 
     quote! {
@@ -1420,7 +1442,7 @@ fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStre
 /// default body. Every method that cannot be placed is collected, so the
 /// caller reports them all in one pass.
 fn build_reflexive(
-    kind: Reflexive,
+    kind: ReflexiveKind,
     shim: &Ident,
     source_ref: &TokenStream2,
     items: &[TraitItem],
@@ -1450,8 +1472,8 @@ fn build_reflexive(
     let mut out = TokenStream2::new();
     for MarkerCombo { markers, .. } in combos {
         let self_ty = match kind {
-            Reflexive::Bare => quote! { dyn #shim #markers },
-            Reflexive::Boxed => quote! { ::std::boxed::Box<dyn #shim #markers> },
+            ReflexiveKind::Bare => quote! { dyn #shim #markers },
+            ReflexiveKind::Boxed => quote! { ::std::boxed::Box<dyn #shim #markers> },
         };
         out.extend(quote! {
             impl #source_ref for #self_ty {
@@ -1467,7 +1489,7 @@ fn build_reflexive(
 /// inherits that default), and `Err` reports a method that cannot be placed in
 /// the impl at all.
 fn reflexive_method(
-    kind: Reflexive,
+    kind: ReflexiveKind,
     shim: &Ident,
     method: &TraitItemFn,
 ) -> syn::Result<Option<TokenStream2>> {
@@ -1493,7 +1515,7 @@ fn reflexive_method(
 
     // `reflexive = bare` impls for the unsized `dyn` type, so an emitted method
     // must not place `Self` by value.
-    if kind == Reflexive::Bare
+    if kind == ReflexiveKind::Bare
         && let Some(err) = bare_inexpressible(method)
     {
         return Err(err);
@@ -1551,7 +1573,7 @@ fn reflexive_method(
 /// (boxed) dereferences to reach the `dyn` type, while `dyn Shim` (bare) is
 /// already there.
 fn reflexive_receiver(
-    kind: Reflexive,
+    kind: ReflexiveKind,
     recv: &Receiver,
     name: &Ident,
 ) -> syn::Result<TokenStream2> {
@@ -1562,13 +1584,13 @@ fn reflexive_receiver(
         (_, ReceiverKind::Value) => quote! { self },
         // `Box<Self>` source receiver: boxed's self is `Box<Box<dyn Shim>>`, so
         // peel one box; bare's self is already `Box<dyn Shim>`.
-        (Reflexive::Boxed, ReceiverKind::Boxed) => quote! { *self },
-        (Reflexive::Bare, ReceiverKind::Boxed) => quote! { self },
+        (ReflexiveKind::Boxed, ReceiverKind::Boxed) => quote! { *self },
+        (ReflexiveKind::Bare, ReceiverKind::Boxed) => quote! { self },
         // `&self` / `&mut self`: boxed reborrows through the box to the `dyn`
         // type; bare's receiver already is `&dyn Shim`.
-        (Reflexive::Boxed, ReceiverKind::Ref) => quote! { &**self },
-        (Reflexive::Boxed, ReceiverKind::RefMut) => quote! { &mut **self },
-        (Reflexive::Bare, ReceiverKind::Ref | ReceiverKind::RefMut) => quote! { self },
+        (ReflexiveKind::Boxed, ReceiverKind::Ref) => quote! { &**self },
+        (ReflexiveKind::Boxed, ReceiverKind::RefMut) => quote! { &mut **self },
+        (ReflexiveKind::Bare, ReceiverKind::Ref | ReceiverKind::RefMut) => quote! { self },
         (_, ReceiverKind::Other) => {
             return Err(syn::Error::new_spanned(
                 recv,
