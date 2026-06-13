@@ -1,4 +1,5 @@
-//! Converting the `dyn-hash` README example to `#[dyn_shim]`.
+//! Converting the `dyn-hash` README example to `#[dyn_shim]`, and why the
+//! result is better.
 //!
 //! The original program:
 //!
@@ -19,28 +20,28 @@
 //! }
 //! ```
 //!
-//! The conversion, applied below:
+//! `#[dyn_shim(DynMyTrait: Hash)]` replaces both the `: DynHash` supertrait and
+//! the `hash_trait_object!` call, and improves on them:
 //!
-//! 1. `use dyn_hash::DynHash;` becomes `use dyn_shim::dyn_shim;`.
-//! 2. The `: DynHash` supertrait moves into the attribute: a plain
-//!    `trait MyTrait` annotated with `#[dyn_shim(DynMyTrait: Hash)]`.
-//! 3. The `dyn_hash::hash_trait_object!(MyTrait);` call is dropped with no
-//!    replacement; the attribute generates the `Hash` impls for the shim's
-//!    `dyn` types.
-//! 4. Trait objects are written `dyn DynMyTrait` instead of `dyn MyTrait`.
+//! - Nothing extra to call. The attribute emits the `Hash` impl for the shim's
+//!   `dyn` types directly, so there is no separate `hash_trait_object!` step to
+//!   remember per trait.
+//! - The `Hash` bound applies only to types used through the shim, not to every
+//!   `MyTrait` implementor. A non-`Hash` type may still implement `MyTrait`; it
+//!   simply never becomes a `DynMyTrait`. To keep the original "all implementors
+//!   are `Hash`" contract, also write `trait MyTrait: Hash`.
 //!
-//! Trait impls are untouched.
+//! And nothing is lost: with the `dyn_hash` feature, `DynMyTrait` is a
+//! `dyn_shim::DynHash`, so the shim still satisfies `DynHash` bounds. A `&dyn
+//! DynMyTrait` upcasts to `&dyn DynHash` and flows wherever that is expected
+//! (see the tail of `main`).
 //!
-//! Step 2 loosens a requirement the original had: with `: DynHash`, every
-//! implementor of `MyTrait` was forced to be `Hash`. The attribute bound
-//! requires `Hash` only of types used through the shim, so a non-`Hash` type
-//! may now implement `MyTrait`; it simply never becomes a `DynMyTrait` and
-//! cannot enter a `Box<dyn DynMyTrait>`. To keep the original contract, also
-//! write the supertrait yourself: `trait MyTrait: Hash`. That composes with
-//! the attribute, and gives generic code over `T: MyTrait` back its
-//! `.hash(...)`.
+//! The conversion: swap the import for `dyn_shim`, move `: DynHash` into the
+//! attribute as `: Hash`, drop the `hash_trait_object!` call, and write `dyn
+//! DynMyTrait` for the trait object.
 //!
-//! Run with: `cargo run --example migrate_dyn_hash`
+//! Run with: `cargo run --example migrate_dyn_hash` (add `--features dyn_hash` for
+//! the `DynHash`-bound interop at the end).
 
 use dyn_shim::dyn_shim;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -71,4 +72,14 @@ fn main() {
     // The derived Hash works even though the struct holds a trait object.
     let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(&container);
     println!("container hash: {hash:016x}");
+
+    // Our shim still plugs into DynHash code: a Box<dyn DynMyTrait> upcasts to
+    // Box<dyn DynHash>, which is `Hash` and hashes like the concrete value.
+    #[cfg(feature = "dyn_hash")]
+    {
+        let obj: Box<dyn DynMyTrait> = Box::new(String::from("jabberwock"));
+        let erased: Box<dyn dyn_shim::DynHash> = obj; // upcast
+        let h = BuildHasherDefault::<DefaultHasher>::default().hash_one(&*erased);
+        println!("via DynHash: {h:016x}");
+    }
 }

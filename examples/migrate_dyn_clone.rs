@@ -1,4 +1,5 @@
-//! Converting the `dyn_clone` README example to `#[dyn_shim]`.
+//! Converting the `dyn_clone` README example to `#[dyn_shim]`, and why the
+//! result is better.
 //!
 //! The original program:
 //!
@@ -11,48 +12,45 @@
 //!
 //! impl MyTrait for String {
 //!     fn recite(&self) {
-//!         println!("{} ♫", self);
+//!         println!("{} reporting in", self);
 //!     }
 //! }
 //!
 //! fn main() {
 //!     let line = "The slithy structs did gyre and gimble the namespace";
-//!
-//!     // Build a trait object holding a String.
-//!     // This requires String to implement MyTrait and std::clone::Clone.
 //!     let x: Box<dyn MyTrait> = Box::new(String::from(line));
-//!
 //!     x.recite();
-//!
-//!     // The type of x2 is a Box<dyn MyTrait> cloned from x.
 //!     let x2 = dyn_clone::clone_box(&*x);
-//!
 //!     x2.recite();
 //! }
 //! ```
 //!
-//! The conversion, applied below:
+//! `#[dyn_shim(DynMyTrait: Clone)]` replaces both the `: DynClone` supertrait
+//! and the `clone_box`/`clone_trait_object!` machinery, and improves on it:
 //!
-//! 1. `use dyn_clone::DynClone;` becomes `use dyn_shim::dyn_shim;`.
-//! 2. The `: DynClone` supertrait moves into the attribute: a plain
-//!    `trait MyTrait` annotated with `#[dyn_shim(DynMyTrait: Clone)]`.
-//! 3. Trait objects are written `dyn DynMyTrait` instead of `dyn MyTrait`.
-//! 4. `dyn_clone::clone_box(&*x)` becomes plain `x.clone()` on the box. For
-//!    a borrowed `&dyn DynMyTrait`, where `.clone()` would copy the
-//!    reference, `.to_owned()` is the direct `clone_box` equivalent.
+//! - No `unsafe`. `dyn_clone` reconstitutes a cloned `Box<dyn MyTrait>` with a
+//!   raw fat-pointer splice. The generated shim clones through a safe coercion,
+//!   because the clone method lives on `DynMyTrait` itself, so the compiler
+//!   builds the `Box<dyn DynMyTrait>` with no pointer surgery.
+//! - Nothing extra to call. The attribute emits the `Clone` impl directly, plus
+//!   a `ToOwned` impl for `dyn DynMyTrait` (which `dyn_clone` does not provide),
+//!   so a borrowed `&dyn DynMyTrait` can escape as an owned box.
+//! - The `Clone` bound applies only to types used through the shim, not to every
+//!   `MyTrait` implementor. A non-`Clone` type may still implement `MyTrait`; it
+//!   simply never becomes a `DynMyTrait`. To keep the original "all implementors
+//!   are `Clone`" contract, also write `trait MyTrait: Clone`.
 //!
-//! Trait impls are untouched.
+//! And nothing is lost: with the `dyn_clone` feature, `DynMyTrait` is a
+//! `dyn_shim::DynClone`, so the shim still satisfies `DynClone` bounds. A
+//! `Box<dyn DynMyTrait>` works wherever a `DynClone` bound or `Box<dyn
+//! DynClone>` is expected (see the tail of `main`).
 //!
-//! Step 2 loosens a requirement the original had: with `: DynClone`, every
-//! implementor of `MyTrait` was forced to be `Clone`. The attribute bound
-//! requires `Clone` only of types used through the shim, so a non-`Clone`
-//! type may now implement `MyTrait`; it simply never becomes a `DynMyTrait`
-//! and cannot enter a `Box<dyn DynMyTrait>`. To keep the original contract,
-//! also write the supertrait yourself: `trait MyTrait: Clone`. That composes
-//! with the attribute, and gives generic code over `T: MyTrait` back its
-//! `.clone()`.
+//! The conversion: swap the import for `dyn_shim`, move `: DynClone` into the
+//! attribute as `: Clone`, drop the `clone_box` call in favor of `.clone()`
+//! (`.to_owned()` on a borrow), and write `dyn DynMyTrait` for the trait object.
 //!
-//! Run with: `cargo run --example migrate_dyn_clone`
+//! Run with: `cargo run --example migrate_dyn_clone` (add `--features dyn_clone`
+//! for the `DynClone`-bound interop at the end).
 
 use dyn_shim::dyn_shim;
 
@@ -65,27 +63,27 @@ trait MyTrait {
 // Unchanged.
 impl MyTrait for String {
     fn recite(&self) {
-        println!("{} ♫", self);
+        println!("{} reporting in", self);
     }
 }
 
 fn main() {
     let line = "The slithy structs did gyre and gimble the namespace";
 
-    // Build a trait object holding a String.
-    // This requires String to implement MyTrait and std::clone::Clone,
-    // exactly as before: the blanket impl of DynMyTrait demands both.
     // Was: let x: Box<dyn MyTrait> = ...;
     let x: Box<dyn DynMyTrait> = Box::new(String::from(line));
-
     x.recite();
 
-    // The type of x2 is a Box<dyn DynMyTrait> cloned from x: the Clone bound
-    // gives the box a real Clone impl, no clone_box helper needed. (When you
-    // only hold a borrowed &dyn DynMyTrait, use .to_owned() instead; .clone()
-    // on a reference copies the reference.)
     // Was: let x2 = dyn_clone::clone_box(&*x);
     let x2 = x.clone();
-
     x2.recite();
+
+    // Our shim still satisfies a `DynClone` bound, with no `unsafe` and no
+    // `clone_trait_object!`: `Box<dyn DynMyTrait>` is a `dyn_shim::DynClone`.
+    #[cfg(feature = "dyn_clone")]
+    {
+        fn needs_dyn_clone<T: dyn_shim::DynClone>(_: T) {}
+        let x3: Box<dyn DynMyTrait> = Box::new(String::from(line));
+        needs_dyn_clone(x3);
+    }
 }
