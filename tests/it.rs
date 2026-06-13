@@ -627,3 +627,128 @@ fn foreign_recognized_bound_and_markers() {
     let copy = send.clone();
     assert_eq!(std::thread::spawn(move || copy.color()).join().unwrap(), 7);
 }
+
+// `reflexive = boxed` additionally emits `impl Munch for Box<dyn DynMunch>`, so
+// the boxed trait object satisfies the source trait itself and can be passed to
+// code generic over `Munch`. The dyn-compatible methods forward through the
+// shim (by-value `self` arrives as the shim's `Box<Self>`); `fresh` is not
+// dyn-compatible, so it is opted into a panicking stub.
+#[dyn_shim(DynMunch, reflexive = boxed)]
+trait Munch {
+    fn crunch(self) -> u32;
+    fn bites(&self) -> u32;
+    #[dyn_shim(panic)]
+    fn fresh() -> Self;
+}
+
+struct Apple(u32);
+impl Munch for Apple {
+    fn crunch(self) -> u32 {
+        self.0
+    }
+    fn bites(&self) -> u32 {
+        self.0 * 2
+    }
+    fn fresh() -> Self {
+        Apple(1)
+    }
+}
+
+fn eat(m: impl Munch) -> u32 {
+    m.crunch()
+}
+fn count(m: &impl Munch) -> u32 {
+    m.bites()
+}
+
+#[test]
+fn reflexive_box_satisfies_source_trait() {
+    let m: Box<dyn DynMunch> = Box::new(Apple(7));
+    // `&Box<dyn DynMunch>` is an `&impl Munch`: forwards `bites` through the shim.
+    assert_eq!(count(&m), 14);
+    // `Box<dyn DynMunch>` is an `impl Munch`: by-value `crunch` consumes the box.
+    assert_eq!(eat(m), 7);
+}
+
+#[test]
+#[should_panic = "not available on the type-erased `DynMunch` shim"]
+fn reflexive_stub_panics_when_called() {
+    fn make<T: Munch>() -> T {
+        T::fresh()
+    }
+    let _: Box<dyn DynMunch> = make();
+}
+
+// `reflexive = bare` emits `impl Shape for dyn DynShape`, so a `&dyn DynShape`
+// (or `&mut`) satisfies the source trait directly, by reference.
+#[dyn_shim(DynShape, reflexive = bare)]
+trait Shape {
+    fn area(&self) -> u32;
+    fn grow(&mut self, by: u32);
+}
+
+struct Sq(u32);
+impl Shape for Sq {
+    fn area(&self) -> u32 {
+        self.0 * self.0
+    }
+    fn grow(&mut self, by: u32) {
+        self.0 += by;
+    }
+}
+
+fn measure<T: Shape + ?Sized>(s: &T) -> u32 {
+    s.area()
+}
+
+#[test]
+fn reflexive_bare_satisfies_by_ref() {
+    let mut sq = Sq(3);
+    {
+        let d: &mut dyn DynShape = &mut sq;
+        Shape::grow(d, 1);
+    }
+    let d: &dyn DynShape = &sq;
+    assert_eq!(measure(d), 16);
+}
+
+// `reflexive` works through the foreign form too: a `Box<dyn DynBrew>` is made
+// to satisfy the foreign `cafe::Brew`, so it can be handed to code in (or
+// generic over) the dependency that expects `impl Brew`, including the
+// by-value `finish` that the dependency cannot dispatch itself.
+mod cafe {
+    pub trait Brew {
+        fn sip(&self) -> u32;
+        fn finish(self) -> u32;
+    }
+}
+
+struct Cup(u32);
+impl cafe::Brew for Cup {
+    fn sip(&self) -> u32 {
+        self.0
+    }
+    fn finish(self) -> u32 {
+        self.0 + 1
+    }
+}
+
+#[dyn_shim_foreign(cafe::Brew, reflexive = boxed)]
+trait DynBrew {
+    fn sip(&self) -> u32;
+    fn finish(self) -> u32; // by-value -> self: Box<Self>
+}
+
+fn taste(b: &impl cafe::Brew) -> u32 {
+    b.sip()
+}
+fn drink(b: impl cafe::Brew) -> u32 {
+    b.finish()
+}
+
+#[test]
+fn foreign_reflexive_satisfies_source() {
+    let b: Box<dyn DynBrew> = Box::new(Cup(4));
+    assert_eq!(taste(&b), 4);
+    assert_eq!(drink(b), 5);
+}

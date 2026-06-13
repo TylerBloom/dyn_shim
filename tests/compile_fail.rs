@@ -66,3 +66,16 @@ fn unlisted_marker_not_covered() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/bound_clone_unlisted_marker.rs");
 }
+
+// A `reflexive` impl must account for every source method. `reflexive = bare`
+// cannot express a by-value `self` receiver (the `dyn` shim is unsized), and a
+// non-dyn-compatible method cannot forward through the shim unless it is opted
+// into a panicking stub with `#[dyn_shim(panic)]`. Both errors come from the
+// macro itself, so the snapshots are stable across toolchains.
+#[test]
+fn reflexive_impl_must_be_complete() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/reflexive_bare_by_value.rs");
+    t.compile_fail("tests/ui/reflexive_unstubbed_method.rs");
+    t.compile_fail("tests/ui/reflexive_unstubbed_multiple.rs");
+}

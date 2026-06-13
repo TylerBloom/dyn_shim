@@ -17,16 +17,63 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, ReturnType, Signature, Token,
-    TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
+    Attribute, FnArg, GenericParam, Ident, ItemTrait, Pat, Path, Receiver, ReturnType, Signature,
+    Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
 };
+
+/// Which reflexive `impl SourceTrait for <shim object>` the macro emits in
+/// addition to the blanket `impl<T: SourceTrait> Shim for T`, so the shim's
+/// trait object satisfies the source trait itself. Selected with
+/// `reflexive = bare` or `reflexive = boxed` in the attribute.
+#[derive(Clone, Copy, PartialEq)]
+enum Reflexive {
+    /// `impl SourceTrait for dyn Shim`. `Self` is the unsized `dyn` type, so a
+    /// by-value `self` receiver or a by-value `Self` in the signature cannot be
+    /// expressed.
+    Bare,
+    /// `impl SourceTrait for Box<dyn Shim>`. `Self` is the sized boxed type, so
+    /// by-value `self` and `-> Self` become `Box<dyn Shim>` and work.
+    Boxed,
+}
+
+impl Parse for Reflexive {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let kind: Ident = input.parse()?;
+        match kind.to_string().as_str() {
+            "bare" => Ok(Reflexive::Bare),
+            "boxed" => Ok(Reflexive::Boxed),
+            _ => Err(syn::Error::new_spanned(
+                kind,
+                "unsupported reflexive kind, expected `bare` or `boxed`",
+            )),
+        }
+    }
+}
+
+/// Parse an optional trailing `, reflexive = <kind>` from an attribute's
+/// argument list, after whatever each attribute reads first (the shim name and
+/// bounds for [`macro@dyn_shim`], the source path for
+/// [`macro@dyn_shim_foreign`]).
+fn parse_reflexive(input: ParseStream) -> syn::Result<Option<Reflexive>> {
+    if !input.peek(Token![,]) {
+        return Ok(None);
+    }
+    input.parse::<Token![,]>()?;
+    let key: Ident = input.parse()?;
+    if key != "reflexive" {
+        return Err(syn::Error::new_spanned(key, "expected `reflexive`"));
+    }
+    input.parse::<Token![=]>()?;
+    Ok(Some(input.parse()?))
+}
 
 /// Arguments to [`macro@dyn_shim`]: the shim trait's name, optionally followed
 /// by supertraits to put on it, written like a trait's supertrait list
-/// (`DynFoo: Send + Sync`).
+/// (`DynFoo: Send + Sync`), and an optional `, reflexive = bare | boxed`.
 struct Args {
     shim_name: Ident,
     bounds: Punctuated<TypeParamBound, Token![+]>,
+    reflexive: Option<Reflexive>,
 }
 
 impl Parse for Args {
@@ -37,7 +84,27 @@ impl Parse for Args {
             input.parse::<Token![:]>()?;
             bounds = Punctuated::parse_separated_nonempty(input)?;
         }
-        Ok(Args { shim_name, bounds })
+        let reflexive = parse_reflexive(input)?;
+        Ok(Args {
+            shim_name,
+            bounds,
+            reflexive,
+        })
+    }
+}
+
+/// Arguments to [`macro@dyn_shim_foreign`]: the path to the foreign source
+/// trait, and an optional `, reflexive = bare | boxed`.
+struct ForeignArgs {
+    source: Path,
+    reflexive: Option<Reflexive>,
+}
+
+impl Parse for ForeignArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let source = input.parse()?;
+        let reflexive = parse_reflexive(input)?;
+        Ok(ForeignArgs { source, reflexive })
     }
 }
 
@@ -698,12 +765,24 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
 /// ```
 #[proc_macro_attribute]
 pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let Args { shim_name, bounds } = parse_macro_input!(attr as Args);
+    let Args {
+        shim_name,
+        bounds,
+        reflexive,
+    } = parse_macro_input!(attr as Args);
     let input = parse_macro_input!(item as ItemTrait);
     // The source trait is local: refer to it by its own name, and re-emit it.
     let source_ref = input.ident.to_token_stream();
     let source_doc = input.ident.to_string();
-    expand(shim_name, bounds, &input, &source_ref, &source_doc, true)
+    expand(
+        shim_name,
+        bounds,
+        &input,
+        &source_ref,
+        &source_doc,
+        true,
+        reflexive,
+    )
 }
 
 /// Generate a dyn-compatible shim for a trait defined in another crate.
@@ -775,9 +854,9 @@ pub fn dyn_shim(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// [recognized bounds]: macro@dyn_shim#recognized-bounds
 #[proc_macro_attribute]
 pub fn dyn_shim_foreign(attr: TokenStream, item: TokenStream) -> TokenStream {
-    // The only argument is the foreign source trait's path; everything else is
+    // The first argument is the foreign source trait's path; everything else is
     // read off the annotated trait, which is itself the shim.
-    let source = parse_macro_input!(attr as Path);
+    let ForeignArgs { source, reflexive } = parse_macro_input!(attr as ForeignArgs);
     let input = parse_macro_input!(item as ItemTrait);
     let source_ref = source.to_token_stream();
     let source_doc = path_doc_string(&source);
@@ -785,7 +864,15 @@ pub fn dyn_shim_foreign(attr: TokenStream, item: TokenStream) -> TokenStream {
     // from its own name, supertraits, and restated signatures.
     let shim_name = input.ident.clone();
     let bounds = input.supertraits.clone();
-    expand(shim_name, bounds, &input, &source_ref, &source_doc, false)
+    expand(
+        shim_name,
+        bounds,
+        &input,
+        &source_ref,
+        &source_doc,
+        false,
+        reflexive,
+    )
 }
 
 /// Render a path as `a::b::C` for doc links, dropping any generic arguments.
@@ -810,7 +897,9 @@ fn path_doc_string(path: &Path) -> String {
 /// path for the foreign one); `source_doc` is its `::`-joined spelling for doc
 /// links. `reemit` is `true` for the local form, which owns the source trait
 /// and re-emits it with a dyn-compat doc note, and `false` for the foreign
-/// form, whose annotated trait is the shim itself.
+/// form, whose annotated trait is the shim itself. `reflexive`, when set, also
+/// emits an `impl SourceTrait for <shim object>` so the shim's trait object
+/// satisfies the source trait.
 fn expand(
     shim_name: Ident,
     bounds: Punctuated<TypeParamBound, Token![+]>,
@@ -818,6 +907,7 @@ fn expand(
     source_ref: &TokenStream2,
     source_doc: &str,
     reemit: bool,
+    reflexive: Option<Reflexive>,
 ) -> TokenStream {
     if let Some(param) = input.generics.params.first() {
         return syn::Error::new_spanned(param, "dyn_shim does not support generic source traits")
@@ -859,9 +949,10 @@ fn expand(
             Classified::PassThrough => passthrough.push(bound),
         }
     }
-    // The marker combinations only feed the recognized-bound machinery, so
-    // there is nothing to compute when no recognized bound is present.
-    let combos = if recognized.is_empty() {
+    // The marker combinations feed the recognized-bound machinery and the
+    // reflexive impl (one per `dyn Shim + markers` variant), so there is
+    // nothing to compute when neither is present.
+    let combos = if recognized.is_empty() && reflexive.is_none() {
         Vec::new()
     } else {
         marker_combos(&autos)
@@ -876,7 +967,7 @@ fn expand(
         let attrs = match item {
             TraitItem::Fn(item) => {
                 for attr in item.attrs.iter().filter(|a| a.path().is_ident("dyn_shim")) {
-                    if let Err(err) = require_skip(attr) {
+                    if let Err(err) = parse_helper(attr) {
                         return err.to_compile_error().into();
                     }
                 }
@@ -958,6 +1049,20 @@ fn expand(
         recognized_extra.extend(extra);
     }
 
+    // When requested, also emit `impl SourceTrait for <shim object>` (one per
+    // marker combination) so the shim's trait object satisfies the source
+    // trait. If any method cannot be placed in that impl, every such method is
+    // reported at once and the impl is omitted, leaving the shim and blanket
+    // impl above to compile on their own rather than cascading into an
+    // "unimplemented trait items" error on generated code.
+    let reflexive_impl = match reflexive {
+        None => TokenStream2::new(),
+        Some(kind) => match build_reflexive(kind, &shim_name, source_ref, items, &combos) {
+            Ok(tokens) => tokens,
+            Err(err) => err.to_compile_error(),
+        },
+    };
+
     quote! {
         #clean
 
@@ -973,6 +1078,8 @@ fn expand(
         }
 
         #recognized_extra
+
+        #reflexive_impl
     }
     .into()
 }
@@ -1055,6 +1162,278 @@ fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStre
     (shim_sig, shim_impl)
 }
 
+/// Build the reflexive `impl SourceTrait for <shim object>` blocks, one per
+/// marker combination. Each source method either forwards to the shim, gets a
+/// panicking stub (`#[dyn_shim(panic)]`), or is omitted to inherit a trait
+/// default body. Every method that cannot be placed is collected, so the
+/// caller reports them all in one pass.
+fn build_reflexive(
+    kind: Reflexive,
+    shim: &Ident,
+    source_ref: &TokenStream2,
+    items: &[TraitItem],
+    combos: &[MarkerCombo],
+) -> syn::Result<TokenStream2> {
+    let mut entries = Vec::new();
+    let mut errors: Option<syn::Error> = None;
+    for item in items {
+        let TraitItem::Fn(method) = item else {
+            continue;
+        };
+        match reflexive_method(kind, shim, method) {
+            Ok(Some(entry)) => entries.push(entry),
+            // A non-forwardable method with a default body is left off the
+            // impl, so calls fall back to the source trait's default.
+            Ok(None) => {}
+            Err(err) => match &mut errors {
+                Some(acc) => acc.combine(err),
+                None => errors = Some(err),
+            },
+        }
+    }
+    if let Some(err) = errors {
+        return Err(err);
+    }
+
+    let mut out = TokenStream2::new();
+    for MarkerCombo { markers, .. } in combos {
+        let self_ty = match kind {
+            Reflexive::Bare => quote! { dyn #shim #markers },
+            Reflexive::Boxed => quote! { ::std::boxed::Box<dyn #shim #markers> },
+        };
+        out.extend(quote! {
+            impl #source_ref for #self_ty {
+                #(#entries)*
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Build one method of the reflexive impl. `Ok(Some(..))` is a method to emit,
+/// `Ok(None)` omits it (a non-forwardable method with a trait default body
+/// inherits that default), and `Err` reports a method that cannot be placed in
+/// the impl at all.
+fn reflexive_method(
+    kind: Reflexive,
+    shim: &Ident,
+    method: &TraitItemFn,
+) -> syn::Result<Option<TokenStream2>> {
+    let forwardable = skip(method).is_none();
+    let stub = if forwardable {
+        false
+    } else if method.default.is_some() {
+        return Ok(None);
+    } else if helper_of(method) == Some(Helper::Panic) {
+        true
+    } else {
+        let name = &method.sig.ident;
+        let reason = skip(method).unwrap_or("not dyn-compatible");
+        return Err(syn::Error::new_spanned(
+            name,
+            format!(
+                "`{name}` is not dyn-compatible ({reason}), so the reflexive impl cannot \
+                 forward it; annotate it `#[dyn_shim(panic)]` to provide a panicking stub, \
+                 or give it a default body"
+            ),
+        ));
+    };
+
+    // `reflexive = bare` impls for the unsized `dyn` type, so an emitted method
+    // must not place `Self` by value.
+    if kind == Reflexive::Bare
+        && let Some(err) = bare_inexpressible(method)
+    {
+        return Err(err);
+    }
+
+    // The impl restates the source signature (with `Self` left intact: it
+    // resolves to the impl's self type), renaming arguments so the body can
+    // forward them. Only `#[cfg]` gates carry over, matching `forward`.
+    let mut sig = method.sig.clone();
+    let mut names = Vec::new();
+    for (i, arg) in sig.inputs.iter_mut().skip(1).enumerate() {
+        let FnArg::Typed(pat) = arg else { continue };
+        let id = match &*pat.pat {
+            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
+            _ => format_ident!("__a{i}"),
+        };
+        *pat.pat = syn::parse_quote! { #id };
+        names.push(id);
+    }
+    let cfg_attrs: Vec<&Attribute> = method
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg"))
+        .collect();
+
+    let body = if stub {
+        let msg = format!(
+            "`{}` is not available on the type-erased `{shim}` shim",
+            method.sig.ident
+        );
+        quote! { ::std::panic!(#msg) }
+    } else {
+        let name = &method.sig.ident;
+        let recv = match sig.inputs.first() {
+            Some(FnArg::Receiver(recv)) => recv,
+            _ => unreachable!("a forwarded method has a receiver"),
+        };
+        let recv_expr = reflexive_receiver(kind, recv, name)?;
+        // Dispatch through the shim trait by name, so `Self` infers to the
+        // `dyn` type (vtable dispatch to the concrete implementor). Calling the
+        // source method on `self` instead would resolve right back to this impl
+        // and recurse.
+        quote! { #shim::#name(#recv_expr #(, #names)*) }
+    };
+
+    Ok(Some(quote! {
+        #(#cfg_attrs)*
+        #[allow(deprecated)]
+        #sig { #body }
+    }))
+}
+
+/// The receiver expression passed to the shim method when forwarding through
+/// the reflexive impl. Adjusts for the impl's self type: `Box<dyn Shim>`
+/// (boxed) dereferences to reach the `dyn` type, while `dyn Shim` (bare) is
+/// already there.
+fn reflexive_receiver(
+    kind: Reflexive,
+    recv: &Receiver,
+    name: &Ident,
+) -> syn::Result<TokenStream2> {
+    let expr = match (kind, classify_receiver(recv)) {
+        // By-value `self`: boxed's self is `Box<dyn Shim>`, which is exactly the
+        // shim method's `self: Box<Self>`. (Bare never reaches here: a by-value
+        // receiver is rejected earlier as inexpressible.)
+        (_, ReceiverKind::Value) => quote! { self },
+        // `Box<Self>` source receiver: boxed's self is `Box<Box<dyn Shim>>`, so
+        // peel one box; bare's self is already `Box<dyn Shim>`.
+        (Reflexive::Boxed, ReceiverKind::Boxed) => quote! { *self },
+        (Reflexive::Bare, ReceiverKind::Boxed) => quote! { self },
+        // `&self` / `&mut self`: boxed reborrows through the box to the `dyn`
+        // type; bare's receiver already is `&dyn Shim`.
+        (Reflexive::Boxed, ReceiverKind::Ref) => quote! { &**self },
+        (Reflexive::Boxed, ReceiverKind::RefMut) => quote! { &mut **self },
+        (Reflexive::Bare, ReceiverKind::Ref | ReceiverKind::RefMut) => quote! { self },
+        (_, ReceiverKind::Other) => {
+            return Err(syn::Error::new_spanned(
+                recv,
+                format!(
+                    "`{name}`'s `self` receiver is not yet supported in a reflexive impl \
+                     (only `self`, `&self`, `&mut self`, and `self: Box<Self>` are)"
+                ),
+            ));
+        }
+    };
+    Ok(expr)
+}
+
+/// How a forwarded method's receiver is shaped, for reflexive forwarding.
+enum ReceiverKind {
+    /// By-value `self` (or the explicit `self: Self`).
+    Value,
+    /// `&self`.
+    Ref,
+    /// `&mut self`.
+    RefMut,
+    /// `self: Box<Self>`.
+    Boxed,
+    /// Any other typed receiver (`Rc<Self>`, `Arc<Self>`, `Pin<_>`, ...).
+    Other,
+}
+
+fn classify_receiver(recv: &Receiver) -> ReceiverKind {
+    if recv.reference.is_some() {
+        if recv.mutability.is_some() {
+            ReceiverKind::RefMut
+        } else {
+            ReceiverKind::Ref
+        }
+    } else if recv.colon_token.is_none()
+        || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self"))
+    {
+        ReceiverKind::Value
+    } else if is_box_self(&recv.ty) {
+        ReceiverKind::Boxed
+    } else {
+        ReceiverKind::Other
+    }
+}
+
+/// True if a type is `Box<Self>` (by any path spelling of `Box`).
+fn is_box_self(ty: &Type) -> bool {
+    let Type::Path(p) = ty else {
+        return false;
+    };
+    let Some(seg) = p.path.segments.last() else {
+        return false;
+    };
+    seg.ident == "Box"
+        && matches!(&seg.arguments, syn::PathArguments::AngleBracketed(a)
+            if a.args.iter().any(|arg|
+                matches!(arg, syn::GenericArgument::Type(Type::Path(t)) if t.path.is_ident("Self"))))
+}
+
+/// If a method cannot be expressed in a `reflexive = bare` impl (where `Self`
+/// is the unsized `dyn` shim), return the error. Such a method places `Self`
+/// by value: a by-value `self` receiver, a bare `-> Self` return, or a bare
+/// `Self` argument.
+fn bare_inexpressible(method: &TraitItemFn) -> Option<syn::Error> {
+    let sig = &method.sig;
+    let name = &sig.ident;
+
+    if let Some(FnArg::Receiver(recv)) = sig.inputs.first() {
+        let by_value = recv.reference.is_none()
+            && (recv.colon_token.is_none()
+                || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self")));
+        if by_value {
+            return Some(syn::Error::new_spanned(
+                recv,
+                format!(
+                    "`reflexive = bare` cannot include `{name}`: its by-value `self` receiver \
+                     would take the unsized `dyn` shim by value. Use `reflexive = boxed`."
+                ),
+            ));
+        }
+    }
+
+    if let ReturnType::Type(_, ty) = &sig.output
+        && is_bare_self(ty)
+    {
+        return Some(syn::Error::new_spanned(
+            ty,
+            format!(
+                "`reflexive = bare` cannot include `{name}`: it returns `Self` by value, \
+                 which is unsized as the `dyn` shim. Use `reflexive = boxed`."
+            ),
+        ));
+    }
+
+    for arg in sig.inputs.iter().skip(1) {
+        if let FnArg::Typed(pat) = arg
+            && is_bare_self(&pat.ty)
+        {
+            return Some(syn::Error::new_spanned(
+                &pat.ty,
+                format!(
+                    "`reflexive = bare` cannot include `{name}`: it takes `Self` by value, \
+                     which is unsized as the `dyn` shim. Use `reflexive = boxed`."
+                ),
+            ));
+        }
+    }
+
+    None
+}
+
+/// True if a type is exactly the bare `Self` path (not `&Self`, `Box<Self>`,
+/// or another type that merely mentions it).
+fn is_bare_self(ty: &Type) -> bool {
+    matches!(ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self"))
+}
+
 /// Build the doc-comment lines appended to the source trait, pointing readers
 /// at the generated dyn-compatible shim.
 fn source_note(shim_name: &Ident) -> Vec<String> {
@@ -1097,11 +1476,23 @@ fn shim_doc(
     lines
 }
 
+/// A `#[dyn_shim(...)]` helper attribute on a method. `skip` and `panic` are
+/// the supported arguments.
+#[derive(Clone, Copy, PartialEq)]
+enum Helper {
+    /// `#[dyn_shim(skip)]`: leave the method off the shim entirely.
+    Skip,
+    /// `#[dyn_shim(panic)]`: when a reflexive impl is generated, give this
+    /// method a panicking stub there (for methods that cannot forward through
+    /// the shim).
+    Panic,
+}
+
 /// If a method cannot be dispatched through a trait object, return a short
 /// reason it is skipped. Return `None` when the method is forwarded.
 fn skip(method: &TraitItemFn) -> Option<&'static str> {
     let sig = &method.sig;
-    if is_opted_out(method) {
+    if helper_of(method) == Some(Helper::Skip) {
         Some("opted out with #[dyn_shim(skip)]")
     } else if sig.asyncness.is_some() {
         Some("async fn")
@@ -1118,29 +1509,33 @@ fn skip(method: &TraitItemFn) -> Option<&'static str> {
     }
 }
 
-/// Require a method's `#[dyn_shim(...)]` attribute to be exactly
-/// `#[dyn_shim(skip)]`, the only supported helper argument.
-fn require_skip(attr: &Attribute) -> syn::Result<()> {
-    let mut skip = false;
+/// Parse a method's `#[dyn_shim(...)]` attribute, which must carry exactly one
+/// of the supported arguments, `skip` or `panic`.
+fn parse_helper(attr: &Attribute) -> syn::Result<Helper> {
+    let mut helper = None;
     attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("skip") {
-            skip = true;
-            Ok(())
+        let which = if meta.path.is_ident("skip") {
+            Helper::Skip
+        } else if meta.path.is_ident("panic") {
+            Helper::Panic
         } else {
-            Err(meta.error("unsupported dyn_shim argument, expected `skip`"))
+            return Err(meta.error("unsupported dyn_shim argument, expected `skip` or `panic`"));
+        };
+        if helper.replace(which).is_some() {
+            return Err(meta.error("duplicate dyn_shim argument"));
         }
-    })?;
-    if skip {
         Ok(())
-    } else {
-        Err(syn::Error::new_spanned(attr, "expected #[dyn_shim(skip)]"))
-    }
+    })?;
+    helper.ok_or_else(|| {
+        syn::Error::new_spanned(attr, "expected #[dyn_shim(skip)] or #[dyn_shim(panic)]")
+    })
 }
 
-/// True for a method annotated with `#[dyn_shim(skip)]`. The attribute's
-/// arguments were validated up front, so its presence alone means skip.
-fn is_opted_out(method: &TraitItemFn) -> bool {
-    method.attrs.iter().any(|a| a.path().is_ident("dyn_shim"))
+/// The helper argument on a method's `#[dyn_shim(...)]` attribute, if any. The
+/// arguments were validated up front, so parsing cannot fail here.
+fn helper_of(method: &TraitItemFn) -> Option<Helper> {
+    let attr = method.attrs.iter().find(|a| a.path().is_ident("dyn_shim"))?;
+    parse_helper(attr).ok()
 }
 
 /// True if the first parameter is a `self` receiver (`&self`, `&mut self`,
