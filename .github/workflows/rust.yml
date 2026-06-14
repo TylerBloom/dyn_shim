@@ -32,3 +32,25 @@ jobs:
       run: cargo build --verbose --features "${{ matrix.features }}"
     - name: Run tests
       run: cargo test --verbose --features "${{ matrix.features }}"
+
+  miri:
+
+    runs-on: ubuntu-latest
+
+    name: miri (unsafe __clone_box)
+
+    steps:
+    - uses: actions/checkout@v4
+    # `__clone_box` does fat-pointer surgery, the crate's only unsafe code. Miri
+    # checks it for undefined behavior. Miri is nightly-only, so `+nightly`
+    # bypasses the 1.96.0 pin in rust-toolchain.toml.
+    - name: Install Miri
+      run: |
+        rustup toolchain install nightly --component miri
+        cargo +nightly miri setup
+    # Run only tests/it.rs: it exercises `__clone_box` through the `dyn_clone`
+    # tests. The trybuild compile-fail tests are skipped because they shell out
+    # to cargo (which Miri cannot run) and assert 1.96.0 error wording (which
+    # nightly changes).
+    - name: Test unsafe path under Miri
+      run: cargo +nightly miri test --features "dyn_clone dyn_hash" --test it
