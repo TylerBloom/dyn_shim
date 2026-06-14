@@ -131,12 +131,19 @@ against those.
 
 ## Capabilities on an existing trait
 
-`#[dyn_shim]` builds a new dyn-compatible trait from one that is not.
-`#[trait_object]` is for the other case: a trait you own that is already
-dyn-compatible, where you want only its trait objects to be `Clone` or `Hash`.
-It generates no shim. The trait lists `DynClone`/`DynHash` as supertraits to
-carry the machinery, and the attribute names the capabilities to implement, so
-`dyn Foo` itself becomes `Clone`/`Hash`:
+A reflexive impl and `#[trait_object]` are the same operation: emit `impl Target
+for <trait object>` so an erased value satisfies a trait it cannot carry as a
+supertrait. A reflexive impl targets the source trait on a generated shim's
+object; `#[trait_object]` targets `Clone`/`Hash` on a trait you already own. The
+only structural difference is that `#[dyn_shim]` first builds the dyn-compatible
+shim, a step `#[trait_object]` skips because its input is already
+dyn-compatible.
+
+So `#[trait_object]` is for a trait you own that is already dyn-compatible, where
+you want only its trait objects to be `Clone` or `Hash`. It generates no shim.
+The trait lists `DynClone`/`DynHash` as supertraits to carry the machinery, and
+the attribute names the capabilities to implement, so `dyn Foo` itself becomes
+`Clone`/`Hash`:
 
 ```rust
 use dyn_shim::{trait_object, DynClone, DynHash};

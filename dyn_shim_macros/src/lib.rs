@@ -19,19 +19,35 @@ use syn::{
     Token, TraitItem, TraitItemFn, Type, TypeParamBound, parse_macro_input,
 };
 
-/// A reflexive `impl SourceTrait for <shim object>` the macro emits in addition
-/// to the blanket `impl<T: SourceTrait> Shim for T`, so the shim's trait object
-/// satisfies the source trait itself. Selected with `reflexive = bare`,
-/// `reflexive = boxed`, or `reflexive = bare + boxed` (both) in the attribute.
+/// Which trait-object form an impl lands on: the bare unsized `dyn X` or the
+/// sized `Box<dyn X>`. Both the `reflexive` impls and the recognized
+/// `Clone`/`Hash` bridges are the same operation, `impl Target for <object
+/// form>`, so they share this axis. A reflexive impl picks a set of these
+/// (`reflexive = bare`, `boxed`, or `bare + boxed`); each recognized bridge
+/// picks the form its capability needs (`Hash` on bare, `Clone` on boxed).
 #[derive(Clone, Copy, PartialEq)]
-enum ReflexiveKind {
-    /// `impl SourceTrait for dyn Shim`. `Self` is the unsized `dyn` type, so a
-    /// by-value `self` receiver or a by-value `Self` in the signature cannot be
-    /// expressed.
+enum ObjectForm {
+    /// `dyn X`. As a reflexive `impl Target for dyn X`, `Self` is the unsized
+    /// `dyn` type, so a by-value `self` receiver or a by-value `Self` in the
+    /// signature cannot be expressed.
     Bare,
-    /// `impl SourceTrait for Box<dyn Shim>`. `Self` is the sized boxed type, so
-    /// by-value `self` and `-> Self` become `Box<dyn Shim>` and work.
+    /// `Box<dyn X>`. As a reflexive `impl Target for Box<dyn X>`, `Self` is the
+    /// sized boxed type, so by-value `self` and `-> Self` become `Box<dyn X>`
+    /// and work.
     Boxed,
+}
+
+impl ObjectForm {
+    /// The trait-object type this form names for `principal` carrying `markers`:
+    /// `dyn principal markers` (bare) or `Box<dyn principal markers>` (boxed).
+    /// `Box` is named by absolute path so the expansion does not depend on what
+    /// `Box` resolves to at the call site.
+    fn ty(self, principal: impl ToTokens, markers: impl ToTokens) -> TokenStream2 {
+        match self {
+            ObjectForm::Bare => quote! { dyn #principal #markers },
+            ObjectForm::Boxed => quote! { ::std::boxed::Box<dyn #principal #markers> },
+        }
+    }
 }
 
 /// Parse an optional trailing `, reflexive = <kinds>` from an attribute's
@@ -40,7 +56,7 @@ enum ReflexiveKind {
 /// kinds, deduplicated, and empty when no `reflexive` argument is present. The
 /// argument comes after whatever each attribute reads first (the shim name and
 /// bounds for [`macro@dyn_shim`], the source path for [`macro@dyn_shim_foreign`]).
-fn parse_reflexive(input: ParseStream) -> syn::Result<Vec<ReflexiveKind>> {
+fn parse_reflexive(input: ParseStream) -> syn::Result<Vec<ObjectForm>> {
     if !input.peek(Token![,]) {
         return Ok(Vec::new());
     }
@@ -53,8 +69,8 @@ fn parse_reflexive(input: ParseStream) -> syn::Result<Vec<ReflexiveKind>> {
     let mut kinds = Vec::new();
     for ident in Punctuated::<Ident, Token![+]>::parse_separated_nonempty(input)? {
         let kind = match ident.to_string().as_str() {
-            "bare" => ReflexiveKind::Bare,
-            "boxed" => ReflexiveKind::Boxed,
+            "bare" => ObjectForm::Bare,
+            "boxed" => ObjectForm::Boxed,
             _ => {
                 return Err(syn::Error::new_spanned(
                     ident,
@@ -75,7 +91,7 @@ fn parse_reflexive(input: ParseStream) -> syn::Result<Vec<ReflexiveKind>> {
 struct Args {
     shim_name: Ident,
     bounds: Punctuated<TypeParamBound, Token![+]>,
-    reflexive: Vec<ReflexiveKind>,
+    reflexive: Vec<ObjectForm>,
 }
 
 impl Parse for Args {
@@ -99,7 +115,7 @@ impl Parse for Args {
 /// trait, and an optional `, reflexive = bare | boxed | bare + boxed`.
 struct ForeignArgs {
     source: Path,
-    reflexive: Vec<ReflexiveKind>,
+    reflexive: Vec<ObjectForm>,
 }
 
 impl Parse for ForeignArgs {
@@ -110,33 +126,18 @@ impl Parse for ForeignArgs {
     }
 }
 
-/// Arguments to [`macro@dyn_shim_recognized`]: a recognized std trait to expose
-/// as a shim (`Clone` or `Hash`), optionally followed by auto-trait markers
-/// selecting which `dyn` variants are covered (`Clone + Send + Sync`), written
-/// like a bound list.
-struct RecognizedArgs {
+/// A bare `+`-joined bound list, the whole attribute argument for both
+/// [`macro@dyn_shim_recognized`] (a recognized trait to expose as a shim, plus
+/// auto-trait markers) and [`macro@trait_object`] (recognized traits to
+/// implement for a trait's `dyn` objects, plus markers). Each validates the
+/// contents itself; this only parses the syntax (`Clone + Send`).
+struct BoundList {
     bounds: Punctuated<TypeParamBound, Token![+]>,
 }
 
-impl Parse for RecognizedArgs {
+impl Parse for BoundList {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        Ok(RecognizedArgs {
-            bounds: Punctuated::parse_separated_nonempty(input)?,
-        })
-    }
-}
-
-/// Arguments to [`macro@trait_object`]: a list of recognized std traits
-/// (`Clone`, `Hash`) to implement for the annotated trait's `dyn` objects,
-/// optionally followed by auto-trait markers selecting the covered `dyn`
-/// variants, written like a bound list (`Hash + Clone + Send`).
-struct TraitObjectArgs {
-    bounds: Punctuated<TypeParamBound, Token![+]>,
-}
-
-impl Parse for TraitObjectArgs {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        Ok(TraitObjectArgs {
+        Ok(BoundList {
             bounds: Punctuated::parse_separated_nonempty(input)?,
         })
     }
@@ -281,47 +282,49 @@ enum Classified {
     PassThrough,
 }
 
-/// Classify one bound by its bare name. Every recognized, auto, and rejected
-/// name lives in exactly one arm here, so the categories cannot overlap and no
-/// caller has to check them in a particular order. Like the literal `where
-/// Self: Sized` check on methods, this is a token match: trait resolution is
-/// unavailable during expansion, so a path-form bound (`std::clone::Clone`)
-/// is not classified (it falls through to `PassThrough`), and a user-defined
-/// trait that happens to share one of these names is treated as the std one.
-fn classify(bound: &TypeParamBound) -> Classified {
-    let Some(ident) = plain_trait_bound(bound).and_then(syn::Path::get_ident) else {
-        return Classified::PassThrough;
-    };
-    match ident.to_string().as_str() {
-        "Clone" => Classified::Recognized(RecognizedBound::Clone),
-        "Hash" => Classified::Recognized(RecognizedBound::Hash),
-        "Send" => Classified::Auto(AutoTrait::Send),
-        "Sync" => Classified::Auto(AutoTrait::Sync),
-        "Unpin" => Classified::Auto(AutoTrait::Unpin),
-        "UnwindSafe" => Classified::Auto(AutoTrait::UnwindSafe),
-        "RefUnwindSafe" => Classified::Auto(AutoTrait::RefUnwindSafe),
-        "Copy" => Classified::Rejected(
-            "trait objects are unsized and can never be `Copy` (use a `Clone` bound to make the shim's boxes cloneable)",
-        ),
-        "Sized" => Classified::Rejected(
-            "trait objects are unsized, so the shim's `dyn` type can never be `Sized`",
-        ),
-        "Default" => Classified::Rejected(
-            "`Default` has no `self` receiver and cannot be dispatched through a trait object (construct values as concrete types and box them)",
-        ),
-        "PartialEq" => Classified::Rejected(
-            "`PartialEq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)",
-        ),
-        "Eq" => Classified::Rejected(
-            "`Eq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)",
-        ),
-        "PartialOrd" => Classified::Rejected(
-            "`PartialOrd` is not supported: the macro cannot define an order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)",
-        ),
-        "Ord" => Classified::Rejected(
-            "`Ord` is not supported: the macro cannot define a total order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)",
-        ),
-        _ => Classified::PassThrough,
+impl Classified {
+    /// Classify one bound by its bare name. Every recognized, auto, and rejected
+    /// name lives in exactly one arm here, so the categories cannot overlap and no
+    /// caller has to check them in a particular order. Like the literal `where
+    /// Self: Sized` check on methods, this is a token match: trait resolution is
+    /// unavailable during expansion, so a path-form bound (`std::clone::Clone`)
+    /// is not classified (it falls through to `PassThrough`), and a user-defined
+    /// trait that happens to share one of these names is treated as the std one.
+    fn of(bound: &TypeParamBound) -> Classified {
+        let Some(ident) = plain_trait_bound(bound).and_then(syn::Path::get_ident) else {
+            return Classified::PassThrough;
+        };
+        match ident.to_string().as_str() {
+            "Clone" => Classified::Recognized(RecognizedBound::Clone),
+            "Hash" => Classified::Recognized(RecognizedBound::Hash),
+            "Send" => Classified::Auto(AutoTrait::Send),
+            "Sync" => Classified::Auto(AutoTrait::Sync),
+            "Unpin" => Classified::Auto(AutoTrait::Unpin),
+            "UnwindSafe" => Classified::Auto(AutoTrait::UnwindSafe),
+            "RefUnwindSafe" => Classified::Auto(AutoTrait::RefUnwindSafe),
+            "Copy" => Classified::Rejected(
+                "trait objects are unsized and can never be `Copy` (use a `Clone` bound to make the shim's boxes cloneable)",
+            ),
+            "Sized" => Classified::Rejected(
+                "trait objects are unsized, so the shim's `dyn` type can never be `Sized`",
+            ),
+            "Default" => Classified::Rejected(
+                "`Default` has no `self` receiver and cannot be dispatched through a trait object (construct values as concrete types and box them)",
+            ),
+            "PartialEq" => Classified::Rejected(
+                "`PartialEq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)",
+            ),
+            "Eq" => Classified::Rejected(
+                "`Eq` is not yet a recognized bound (cross-type equality on trait objects needs an `Any` downcast the macro does not generate)",
+            ),
+            "PartialOrd" => Classified::Rejected(
+                "`PartialOrd` is not supported: the macro cannot define an order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)",
+            ),
+            "Ord" => Classified::Rejected(
+                "`Ord` is not supported: the macro cannot define a total order between different implementor types (sort with `sort_by_key` or implement the comparison traits for the shim's `dyn` type by hand)",
+            ),
+            _ => Classified::PassThrough,
+        }
     }
 }
 
@@ -332,29 +335,82 @@ struct MarkerCombo {
     markers: TokenStream2,
 }
 
-/// Every subset of the auto traits listed in the bounds, the plain (empty)
-/// combination first. The order markers are written in a `dyn` type does not
-/// affect type identity, so one impl per subset, each written in
-/// the order the auto traits were listed, covers every spelling at the use
-/// site. The count is `2^n` in the number of listed
-/// auto traits.
-fn marker_combos(autos: &[AutoTrait]) -> Vec<MarkerCombo> {
-    (0..1usize << autos.len())
-        .map(|mask| {
-            let mut suffix = String::new();
-            let mut markers = TokenStream2::new();
-            for (i, auto) in autos.iter().enumerate() {
-                if mask & (1 << i) == 0 {
-                    continue;
+impl MarkerCombo {
+    /// Every subset of the listed auto traits, the plain (empty) combination
+    /// first. The order markers are written in a `dyn` type does not affect type
+    /// identity, so one combo per subset, each written in the order the auto
+    /// traits were listed, covers every spelling at the use site. The count is
+    /// `2^n` in the number of listed auto traits.
+    fn all(autos: &[AutoTrait]) -> Vec<MarkerCombo> {
+        (0..1usize << autos.len())
+            .map(|mask| {
+                let mut suffix = String::new();
+                let mut markers = TokenStream2::new();
+                for (i, auto) in autos.iter().enumerate() {
+                    if mask & (1 << i) == 0 {
+                        continue;
+                    }
+                    suffix.push('_');
+                    suffix.push_str(auto.suffix());
+                    let path = auto.path();
+                    markers.extend(quote! { + #path });
                 }
-                suffix.push('_');
-                suffix.push_str(auto.suffix());
-                let path = auto.path();
-                markers.extend(quote! { + #path });
+                MarkerCombo { suffix, markers }
+            })
+            .collect()
+    }
+}
+
+/// The bridge impls that put `Clone` on a trait object: `Clone` for `Box<dyn
+/// principal markers>` (the sized owner) and `ToOwned` for `dyn principal
+/// markers` (for callers holding only a borrow), both cloning the concrete
+/// value into a fresh `Box<dyn principal markers>`. `call` builds the cloning
+/// expression from the receiver it is handed (`&**self` for `Clone`, `self` for
+/// `ToOwned`). The two paths that emit these differ only in `call`: a recognized
+/// bound forwards through a generated carrier method, while `trait_object` calls
+/// `__clone_box`.
+fn clone_bridge(
+    principal: &Ident,
+    markers: &TokenStream2,
+    call: impl Fn(TokenStream2) -> TokenStream2,
+) -> TokenStream2 {
+    let boxed = ObjectForm::Boxed.ty(principal, markers);
+    let bare = ObjectForm::Bare.ty(principal, markers);
+    let clone_call = call(quote! { &**self });
+    let to_owned_call = call(quote! { self });
+    quote! {
+        impl ::std::clone::Clone for #boxed {
+            fn clone(&self) -> Self {
+                #clone_call
             }
-            MarkerCombo { suffix, markers }
-        })
-        .collect()
+        }
+
+        impl ::std::borrow::ToOwned for #bare {
+            type Owned = #boxed;
+            fn to_owned(&self) -> Self::Owned {
+                #to_owned_call
+            }
+        }
+    }
+}
+
+/// The bridge impl that puts `Hash` on a trait object: `Hash` for `dyn
+/// principal markers`, which also covers `&dyn principal` and, through std's
+/// `impl<T: ?Sized + Hash> Hash for Box<T>`, `Box<dyn principal>`. `carrier`
+/// names the trait whose `__dyn_shim_hash` does the erased hashing: the shim
+/// itself for a recognized bound (where that method is generated), or `DynHash`
+/// for `trait_object` (inherited as a supertrait). It is named in a qualified
+/// call so it stays unambiguous when the principal also inherits a same-named
+/// method.
+fn hash_bridge(principal: &Ident, markers: &TokenStream2, carrier: &TokenStream2) -> TokenStream2 {
+    let bare = ObjectForm::Bare.ty(principal, markers);
+    quote! {
+        impl ::std::hash::Hash for #bare {
+            fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
+                <Self as #carrier>::__dyn_shim_hash(self, state)
+            }
+        }
+    }
 }
 
 /// Machinery for a recognized `Clone` bound: per marker combination, a hidden
@@ -390,31 +446,17 @@ fn expand_clone(
                 ::std::boxed::Box::new(::std::clone::Clone::clone(self))
             }
         });
-        // `ToOwned` rides along with `Clone`: both are facades over the same
-        // hidden method, one for callers who own a box and one for callers
-        // holding only `&dyn Shim` (where `.clone()` would silently copy the
-        // reference). Legal because `Clone: Sized` keeps std's blanket
-        // `impl<T: Clone> ToOwned for T` away from the unsized `dyn` type,
-        // and `impl<T: ?Sized> Borrow<T> for Box<T>` supplies the
-        // `Owned: Borrow<Self>` half of the contract.
-        // The calls name `#shim`'s own method explicitly. When the shim also
-        // gains a `DynClone` supertrait (under the `dyn_clone` feature) it inherits
-        // a method of the same name, so a bare `self.#method()` would be
-        // ambiguous; the qualified form is unambiguous and harmless otherwise.
-        after.extend(quote! {
-            impl ::std::clone::Clone for ::std::boxed::Box<dyn #shim #markers> {
-                fn clone(&self) -> Self {
-                    <dyn #shim #markers as #shim>::#method(&**self)
-                }
-            }
-
-            impl ::std::borrow::ToOwned for dyn #shim #markers {
-                type Owned = ::std::boxed::Box<dyn #shim #markers>;
-                fn to_owned(&self) -> Self::Owned {
-                    <dyn #shim #markers as #shim>::#method(self)
-                }
-            }
-        });
+        // `ToOwned` rides along with `Clone` (handled by `clone_bridge`), one
+        // facade for callers who own a box and one for callers holding only
+        // `&dyn Shim` (where `.clone()` would silently copy the reference).
+        // Forward through `#shim`'s own hidden method, named in a qualified call:
+        // when the shim also gains a `DynClone` supertrait (under the `dyn_clone`
+        // feature) it inherits a same-named method, so a bare `self.#method()`
+        // would be ambiguous.
+        let on = ObjectForm::Bare.ty(shim, markers);
+        after.extend(clone_bridge(shim, markers, |recv| {
+            quote! { <#on as #shim>::#method(#recv) }
+        }));
     }
     (sigs, impls, after)
 }
@@ -436,17 +478,12 @@ fn expand_hash(shim: &Ident, combos: &[MarkerCombo]) -> (TokenStream2, TokenStre
             <__T as ::std::hash::Hash>::hash(self, &mut state)
         }
     };
+    // The carrier method `__dyn_shim_hash` is generated on the shim itself, so
+    // the bridge forwards through `#shim`.
+    let carrier = quote! { #shim };
     let mut after = TokenStream2::new();
     for MarkerCombo { markers, .. } in combos {
-        // Qualified so it stays unambiguous if the shim inherits a same-named
-        // method from a `DynHash` supertrait (under the `dyn_hash` feature).
-        after.extend(quote! {
-            impl ::std::hash::Hash for dyn #shim #markers {
-                fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
-                    <dyn #shim #markers as #shim>::__dyn_shim_hash(self, state)
-                }
-            }
-        });
+        after.extend(hash_bridge(shim, markers, &carrier));
     }
     (sigs, impls, after)
 }
@@ -1040,7 +1077,7 @@ pub fn dyn_shim_foreign(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// [bound]: macro@dyn_shim#recognized-bounds
 #[proc_macro_attribute]
 pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let RecognizedArgs { bounds } = parse_macro_input!(attr as RecognizedArgs);
+    let BoundList { bounds } = parse_macro_input!(attr as BoundList);
     let input = parse_macro_input!(item as ItemTrait);
     expand_recognized(&input, bounds)
 }
@@ -1105,9 +1142,76 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
 /// happens to be named `DynHash` is accepted in its place.
 #[proc_macro_attribute]
 pub fn trait_object(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let TraitObjectArgs { bounds } = parse_macro_input!(attr as TraitObjectArgs);
+    let BoundList { bounds } = parse_macro_input!(attr as BoundList);
     let input = parse_macro_input!(item as ItemTrait);
     expand_trait_object(&input, bounds)
+}
+
+/// If the annotated trait has any generic parameters, return the compile error
+/// to emit. Every entry point builds non-parameterized output (one shim or one
+/// set of `dyn` impls), so a type, const, or lifetime parameter has nowhere to
+/// go. `message` is the full error text, naming the macro and what it cannot be
+/// generic over.
+fn reject_generics(input: &ItemTrait, message: &str) -> Option<TokenStream> {
+    input.generics.params.first().map(|param| {
+        syn::Error::new_spanned(param, message)
+            .to_compile_error()
+            .into()
+    })
+}
+
+/// The attribute's bound list split by [`Classified::of`], with each caller left to
+/// apply its own policy. `recognized` and `autos` are deduplicated in listing
+/// order. `supertraits` is the auto-trait and pass-through bounds in listing
+/// order, ready to re-emit as a shim's supertraits. `passthrough` is just the
+/// plain pass-through bounds, kept for their spans: `dyn_shim` keeps them as
+/// supertraits, while `trait_object` and `dyn_shim_recognized` reject the first
+/// one. `rejected` pairs each known-impossible bound (`Copy`, `Ord`, ...) with
+/// its targeted message, in listing order. Duplicates are dropped silently,
+/// matching the language's own tolerance of `trait Foo: A + A`.
+struct ClassifiedBounds {
+    recognized: Vec<RecognizedBound>,
+    autos: Vec<AutoTrait>,
+    supertraits: Punctuated<TypeParamBound, Token![+]>,
+    passthrough: Vec<TypeParamBound>,
+    rejected: Vec<(TypeParamBound, &'static str)>,
+}
+
+impl ClassifiedBounds {
+    fn classify(bounds: &Punctuated<TypeParamBound, Token![+]>) -> ClassifiedBounds {
+        let mut recognized = Vec::new();
+        let mut autos = Vec::new();
+        let mut supertraits = Punctuated::new();
+        let mut passthrough = Vec::new();
+        let mut rejected = Vec::new();
+        for bound in bounds {
+            match Classified::of(bound) {
+                Classified::Recognized(k) => {
+                    if !recognized.contains(&k) {
+                        recognized.push(k);
+                    }
+                }
+                Classified::Auto(auto) => {
+                    if !autos.contains(&auto) {
+                        autos.push(auto);
+                    }
+                    supertraits.push(bound.clone());
+                }
+                Classified::Rejected(msg) => rejected.push((bound.clone(), msg)),
+                Classified::PassThrough => {
+                    passthrough.push(bound.clone());
+                    supertraits.push(bound.clone());
+                }
+            }
+        }
+        ClassifiedBounds {
+            recognized,
+            autos,
+            supertraits,
+            passthrough,
+            rejected,
+        }
+    }
 }
 
 /// Expansion for [`macro@trait_object`]: re-emit the annotated trait unchanged
@@ -1118,41 +1222,30 @@ fn expand_trait_object(
     input: &ItemTrait,
     bounds: Punctuated<TypeParamBound, Token![+]>,
 ) -> TokenStream {
-    if let Some(param) = input.generics.params.first() {
-        return syn::Error::new_spanned(param, "trait_object does not support generic traits")
+    if let Some(err) = reject_generics(input, "trait_object does not support generic traits") {
+        return err;
+    }
+
+    let ClassifiedBounds {
+        recognized,
+        autos,
+        passthrough,
+        rejected,
+        ..
+    } = ClassifiedBounds::classify(&bounds);
+    if let Some((bound, msg)) = rejected.into_iter().next() {
+        return syn::Error::new_spanned(bound, msg)
             .to_compile_error()
             .into();
     }
-
-    let mut recognized = Vec::new();
-    let mut autos = Vec::new();
-    for bound in &bounds {
-        match classify(bound) {
-            Classified::Recognized(k) => {
-                if !recognized.contains(&k) {
-                    recognized.push(k);
-                }
-            }
-            Classified::Auto(auto) => {
-                if !autos.contains(&auto) {
-                    autos.push(auto);
-                }
-            }
-            Classified::Rejected(msg) => {
-                return syn::Error::new_spanned(bound, msg)
-                    .to_compile_error()
-                    .into();
-            }
-            Classified::PassThrough => {
-                return syn::Error::new_spanned(
-                    bound,
-                    "trait_object expects recognized traits (`Clone` or `Hash`), optionally \
-                     followed by auto-trait markers",
-                )
-                .to_compile_error()
-                .into();
-            }
-        }
+    if let Some(bound) = passthrough.first() {
+        return syn::Error::new_spanned(
+            bound,
+            "trait_object expects recognized traits (`Clone` or `Hash`), optionally \
+             followed by auto-trait markers",
+        )
+        .to_compile_error()
+        .into();
     }
     if recognized.is_empty() {
         return syn::Error::new_spanned(
@@ -1168,16 +1261,16 @@ fn expand_trait_object(
     // rather than letting the bridge's call to the inherited method fail to
     // compile on generated code.
     for k in &recognized {
-        if let Err(err) = require_carrier(input, *k) {
+        if let Err(err) = k.require_carrier(input) {
             return err.to_compile_error().into();
         }
     }
 
     let trait_ident = &input.ident;
-    let combos = marker_combos(&autos);
+    let combos = MarkerCombo::all(&autos);
     let mut bridges = TokenStream2::new();
     for k in &recognized {
-        bridges.extend(trait_object_bridge(*k, trait_ident, &combos));
+        bridges.extend(k.trait_object_bridge(trait_ident, &combos));
     }
 
     quote! {
@@ -1187,80 +1280,61 @@ fn expand_trait_object(
     .into()
 }
 
-/// Check that the annotated trait inherits the carrier supertrait a recognized
-/// capability needs (`DynClone` for `Clone`, `DynHash` for `Hash`). A
-/// bare-name token match, like [`classify`].
-fn require_carrier(input: &ItemTrait, k: RecognizedBound) -> syn::Result<()> {
-    let (carrier, capability) = match k {
-        RecognizedBound::Clone => ("DynClone", "Clone"),
-        RecognizedBound::Hash => ("DynHash", "Hash"),
-    };
-    let present = input.supertraits.iter().any(|bound| {
-        plain_trait_bound(bound)
-            .and_then(|path| path.segments.last())
-            .is_some_and(|seg| seg.ident == carrier)
-    });
-    if present {
-        Ok(())
-    } else {
-        Err(syn::Error::new_spanned(
-            &input.ident,
-            format!(
-                "trait_object({capability}) needs `{carrier}` as a supertrait; \
-                 write `trait {}: {carrier}`",
-                input.ident
-            ),
-        ))
-    }
-}
-
-/// The bridge impls for one recognized capability on `dyn TraitIdent + markers`,
-/// one per marker combination. Each forwards to the carrier method inherited
-/// from the `DynClone`/`DynHash` supertrait.
-fn trait_object_bridge(
-    k: RecognizedBound,
-    trait_ident: &Ident,
-    combos: &[MarkerCombo],
-) -> TokenStream2 {
-    let mut out = TokenStream2::new();
-    match k {
-        // `Hash` is implemented on `dyn Trait` itself, which also covers
-        // `&dyn Trait` and, through std's forwarding impl, `Box<dyn Trait>`.
-        // The carrier erases the generic hasher to `&mut dyn Hasher`.
-        RecognizedBound::Hash => {
-            for MarkerCombo { markers, .. } in combos {
-                out.extend(quote! {
-                    impl ::std::hash::Hash for dyn #trait_ident #markers {
-                        fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
-                            <Self as ::dyn_shim::DynHash>::__dyn_shim_hash(self, state)
-                        }
-                    }
-                });
-            }
-        }
-        // `Clone` is implemented on `Box<dyn Trait>` (the sized owner), and
-        // `ToOwned` on `dyn Trait` for callers holding only a borrow. Both clone
-        // the concrete value into a fresh `Box<dyn Trait>` via the carrier.
-        RecognizedBound::Clone => {
-            for MarkerCombo { markers, .. } in combos {
-                out.extend(quote! {
-                    impl ::std::clone::Clone for ::std::boxed::Box<dyn #trait_ident #markers> {
-                        fn clone(&self) -> Self {
-                            ::dyn_shim::__clone_box(&**self)
-                        }
-                    }
-
-                    impl ::std::borrow::ToOwned for dyn #trait_ident #markers {
-                        type Owned = ::std::boxed::Box<dyn #trait_ident #markers>;
-                        fn to_owned(&self) -> Self::Owned {
-                            ::dyn_shim::__clone_box(self)
-                        }
-                    }
-                });
-            }
+impl RecognizedBound {
+    /// Check that the annotated trait inherits the carrier supertrait this
+    /// capability needs (`DynClone` for `Clone`, `DynHash` for `Hash`). A
+    /// bare-name token match, like [`Classified::of`].
+    fn require_carrier(self, input: &ItemTrait) -> syn::Result<()> {
+        let (carrier, capability) = match self {
+            RecognizedBound::Clone => ("DynClone", "Clone"),
+            RecognizedBound::Hash => ("DynHash", "Hash"),
+        };
+        let present = input.supertraits.iter().any(|bound| {
+            plain_trait_bound(bound)
+                .and_then(|path| path.segments.last())
+                .is_some_and(|seg| seg.ident == carrier)
+        });
+        if present {
+            Ok(())
+        } else {
+            Err(syn::Error::new_spanned(
+                &input.ident,
+                format!(
+                    "trait_object({capability}) needs `{carrier}` as a supertrait; \
+                     write `trait {}: {carrier}`",
+                    input.ident
+                ),
+            ))
         }
     }
-    out
+
+    /// The bridge impls for this capability on `dyn TraitIdent + markers`, one
+    /// per marker combination. Each forwards to the carrier method inherited
+    /// from the `DynClone`/`DynHash` supertrait.
+    fn trait_object_bridge(self, trait_ident: &Ident, combos: &[MarkerCombo]) -> TokenStream2 {
+        let mut out = TokenStream2::new();
+        match self {
+            // `Hash` forwards through the inherited `DynHash` carrier, which
+            // erases the generic hasher to `&mut dyn Hasher`.
+            RecognizedBound::Hash => {
+                let carrier = quote! { ::dyn_shim::DynHash };
+                for MarkerCombo { markers, .. } in combos {
+                    out.extend(hash_bridge(trait_ident, markers, &carrier));
+                }
+            }
+            // `Clone` clones the concrete value into a fresh `Box<dyn Trait>`
+            // through `__clone_box`. Unlike the recognized-bound path there is no
+            // blanket impl to clone through, so it uses the fat-pointer carrier.
+            RecognizedBound::Clone => {
+                for MarkerCombo { markers, .. } in combos {
+                    out.extend(clone_bridge(trait_ident, markers, |recv| {
+                        quote! { ::dyn_shim::__clone_box(#recv) }
+                    }));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Render a path as `a::b::C` for doc links, dropping any generic arguments.
@@ -1295,12 +1369,10 @@ fn expand(
     source_ref: &TokenStream2,
     source_doc: &str,
     reemit: bool,
-    reflexive: Vec<ReflexiveKind>,
+    reflexive: Vec<ObjectForm>,
 ) -> TokenStream {
-    if let Some(param) = input.generics.params.first() {
-        return syn::Error::new_spanned(param, "dyn_shim does not support generic source traits")
-            .to_compile_error()
-            .into();
+    if let Some(err) = reject_generics(input, "dyn_shim does not support generic source traits") {
+        return err;
     }
     let vis = &input.vis;
     let items = &input.items;
@@ -1310,32 +1382,19 @@ fn expand(
     // instead becomes a bound on the blanket impl plus proxy machinery on the
     // shim's trait objects. A recognized auto trait passes through like any
     // other bound and additionally selects which `dyn Shim + markers` types
-    // get that machinery. Position in the list never matters.
-    let mut recognized = Vec::new();
-    let mut autos = Vec::new();
-    let mut passthrough: Punctuated<TypeParamBound, Token![+]> = Punctuated::new();
-    for bound in bounds {
-        // Duplicates are deduplicated silently, matching the language's own
-        // tolerance of `trait Foo: A + A`.
-        match classify(&bound) {
-            Classified::Rejected(msg) => {
-                return syn::Error::new_spanned(&bound, msg)
-                    .to_compile_error()
-                    .into();
-            }
-            Classified::Recognized(k) => {
-                if !recognized.contains(&k) {
-                    recognized.push(k);
-                }
-            }
-            Classified::Auto(auto) => {
-                if !autos.contains(&auto) {
-                    autos.push(auto);
-                }
-                passthrough.push(bound);
-            }
-            Classified::PassThrough => passthrough.push(bound),
-        }
+    // get that machinery. A plain bound passes through as a supertrait.
+    // Position in the list never matters.
+    let ClassifiedBounds {
+        recognized,
+        autos,
+        supertraits: passthrough,
+        rejected,
+        ..
+    } = ClassifiedBounds::classify(&bounds);
+    if let Some((bound, msg)) = rejected.into_iter().next() {
+        return syn::Error::new_spanned(bound, msg)
+            .to_compile_error()
+            .into();
     }
     // The marker combinations feed the recognized-bound machinery and the
     // reflexive impl (one per `dyn Shim + markers` variant), so there is
@@ -1343,7 +1402,7 @@ fn expand(
     let combos = if recognized.is_empty() && reflexive.is_empty() {
         Vec::new()
     } else {
-        marker_combos(&autos)
+        MarkerCombo::all(&autos)
     };
 
     // Validate the `#[dyn_shim(...)]` helper attributes: on a method the only
@@ -1355,7 +1414,7 @@ fn expand(
         let attrs = match item {
             TraitItem::Fn(item) => {
                 for attr in item.attrs.iter().filter(|a| a.path().is_ident("dyn_shim")) {
-                    if let Err(err) = parse_helper(attr) {
+                    if let Err(err) = Helper::parse(attr) {
                         return err.to_compile_error().into();
                     }
                 }
@@ -1502,13 +1561,9 @@ fn expand_recognized(
     input: &ItemTrait,
     bounds: Punctuated<TypeParamBound, Token![+]>,
 ) -> TokenStream {
-    if let Some(param) = input.generics.params.first() {
-        return syn::Error::new_spanned(
-            param,
-            "dyn_shim_recognized does not support generic shims",
-        )
-        .to_compile_error()
-        .into();
+    if let Some(err) = reject_generics(input, "dyn_shim_recognized does not support generic shims")
+    {
+        return err;
     }
     if let Some(item) = input.items.first() {
         return syn::Error::new_spanned(
@@ -1530,38 +1585,37 @@ fn expand_recognized(
     }
 
     // Exactly one recognized trait is the principal; the rest must be auto
-    // traits, which select the covered marker combinations.
-    let mut recognized = None;
-    let mut autos = Vec::new();
-    for bound in &bounds {
-        match classify(bound) {
-            Classified::Recognized(k) => {
-                if recognized.replace(k).is_some() {
-                    return syn::Error::new_spanned(
-                        bound,
-                        "expected a single recognized trait (`Clone` or `Hash`)",
-                    )
-                    .to_compile_error()
-                    .into();
-                }
-            }
-            Classified::Auto(auto) => {
-                if !autos.contains(&auto) {
-                    autos.push(auto);
-                }
-            }
-            Classified::Rejected(_) | Classified::PassThrough => {
-                return syn::Error::new_spanned(
-                    bound,
-                    "dyn_shim_recognized expects a recognized trait (`Clone` or `Hash`), \
-                     optionally followed by auto-trait markers",
-                )
-                .to_compile_error()
-                .into();
-            }
-        }
+    // traits, which select the covered marker combinations. A rejected or
+    // pass-through bound is neither, and gets one uniform message.
+    let ClassifiedBounds {
+        recognized,
+        autos,
+        passthrough,
+        rejected,
+        ..
+    } = ClassifiedBounds::classify(&bounds);
+    if let Some(bound) = rejected
+        .first()
+        .map(|(bound, _)| bound)
+        .or_else(|| passthrough.first())
+    {
+        return syn::Error::new_spanned(
+            bound,
+            "dyn_shim_recognized expects a recognized trait (`Clone` or `Hash`), \
+             optionally followed by auto-trait markers",
+        )
+        .to_compile_error()
+        .into();
     }
-    let Some(recognized) = recognized else {
+    if recognized.len() > 1 {
+        return syn::Error::new_spanned(
+            &bounds,
+            "expected a single recognized trait (`Clone` or `Hash`)",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let Some(recognized) = recognized.into_iter().next() else {
         return syn::Error::new_spanned(
             &bounds,
             "dyn_shim_recognized expects a recognized trait (`Clone` or `Hash`)",
@@ -1573,7 +1627,7 @@ fn expand_recognized(
     let shim = &input.ident;
     let vis = &input.vis;
     let attrs = &input.attrs;
-    let combos = marker_combos(&autos);
+    let combos = MarkerCombo::all(&autos);
     let (sigs, impls, extra) = recognized.expand(shim, &combos);
     let impl_bound = recognized.impl_bound();
     let doc = recognized.doc_line(shim);
@@ -1595,6 +1649,37 @@ fn expand_recognized(
     .into()
 }
 
+/// Rename a method's value arguments (everything after the receiver) in place to
+/// their declared idents, giving a synthetic `__a{i}` to any non-trivial pattern
+/// (only legal on a defaulted method). Returns the names in order so a generated
+/// body can forward them.
+fn rename_args(sig: &mut Signature) -> Vec<Ident> {
+    let mut names = Vec::new();
+    for (i, arg) in sig.inputs.iter_mut().skip(1).enumerate() {
+        let FnArg::Typed(pat) = arg else { continue };
+        let id = match &*pat.pat {
+            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
+            _ => format_ident!("__a{i}"),
+        };
+        *pat.pat = syn::parse_quote! { #id };
+        names.push(id);
+    }
+    names
+}
+
+/// A method's `#[cfg]` gates, the only attributes that carry onto a generated
+/// forwarding method. A `#[cfg]`-gated method must stay gated everywhere it is
+/// emitted, while attributes like `#[must_use]` and `#[deprecated]` (and the
+/// `cfg_attr` that can expand to them) are rejected on trait methods in impl
+/// blocks.
+fn cfg_gates(method: &TraitItemFn) -> Vec<&Attribute> {
+    method
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg"))
+        .collect()
+}
+
 /// Build the shim signature and the forwarding impl body for one method.
 ///
 /// The shim method reuses the source method's entire signature (`unsafe`, ABI,
@@ -1613,12 +1698,10 @@ fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStre
     let Some(FnArg::Receiver(recv)) = sig.inputs.first() else {
         unreachable!("skip guarantees a receiver")
     };
-    // `self: Self` is the explicit spelling of by-value `self`; only a typed
-    // receiver with a real wrapper type (Box, Rc, Arc, Pin, ...) is forwarded
-    // unchanged.
-    let by_value = recv.reference.is_none()
-        && (recv.colon_token.is_none()
-            || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self")));
+    // A by-value `self` (or its explicit `self: Self` spelling) is rewritten to
+    // `self: Box<Self>` below; only a typed receiver with a real wrapper type
+    // (Box, Rc, Arc, Pin, ...) is forwarded unchanged.
+    let by_value = matches!(ReceiverKind::of(recv), ReceiverKind::Value);
     let self_expr = if by_value {
         // Absolute path: the expansion must not depend on what `Box` names at
         // the call site (a local shadow, or a missing prelude under no_std).
@@ -1628,35 +1711,18 @@ fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStre
         quote! { self }
     };
 
-    let mut names = Vec::new();
-    for (i, arg) in sig.inputs.iter_mut().skip(1).enumerate() {
-        let FnArg::Typed(pat) = arg else { continue };
-        // Keep the declared name; a non-trivial pattern (only legal on a
-        // defaulted method) gets a synthetic name the impl can forward.
-        let id = match &*pat.pat {
-            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
-            _ => format_ident!("__a{i}"),
-        };
-        *pat.pat = syn::parse_quote! { #id };
-        names.push(id);
-    }
+    let names = rename_args(&mut sig);
 
+    // The shim's signature keeps every attribute except our `#[dyn_shim]`
+    // helpers, so `#[doc]`, `#[must_use]`, and `#[deprecated]` carry over. The
+    // impl method takes only the `#[cfg]` gates (see `cfg_gates`); `#[allow]`
+    // keeps the generated forwarding call to a `#[deprecated]` method quiet.
     let attrs: Vec<&Attribute> = method
         .attrs
         .iter()
         .filter(|a| !a.path().is_ident("dyn_shim"))
         .collect();
-    // The impl method only takes the `cfg` gates: attributes like `#[must_use]`
-    // and `#[deprecated]` are rejected on trait methods in impl blocks (which
-    // also rules out forwarding `cfg_attr`, since it can expand to them), but a
-    // `#[cfg]`-gated method must stay gated everywhere it is emitted.
-    // `#[allow]` keeps the generated forwarding call to a `#[deprecated]`
-    // method from warning.
-    let cfg_attrs: Vec<&Attribute> = attrs
-        .iter()
-        .copied()
-        .filter(|a| a.path().is_ident("cfg"))
-        .collect();
+    let cfg_attrs = cfg_gates(method);
 
     let name = &sig.ident;
     let shim_sig = quote! {
@@ -1679,7 +1745,7 @@ fn forward(method: &TraitItemFn, src: &TokenStream2) -> (TokenStream2, TokenStre
 /// default body. Every method that cannot be placed is collected, so the
 /// caller reports them all in one pass.
 fn build_reflexive(
-    kind: ReflexiveKind,
+    kind: ObjectForm,
     shim: &Ident,
     source_ref: &TokenStream2,
     items: &[TraitItem],
@@ -1708,10 +1774,7 @@ fn build_reflexive(
 
     let mut out = TokenStream2::new();
     for MarkerCombo { markers, .. } in combos {
-        let self_ty = match kind {
-            ReflexiveKind::Bare => quote! { dyn #shim #markers },
-            ReflexiveKind::Boxed => quote! { ::std::boxed::Box<dyn #shim #markers> },
-        };
+        let self_ty = kind.ty(shim, markers);
         out.extend(quote! {
             impl #source_ref for #self_ty {
                 #(#entries)*
@@ -1726,7 +1789,7 @@ fn build_reflexive(
 /// inherits that default), and `Err` reports a method that cannot be placed in
 /// the impl at all.
 fn reflexive_method(
-    kind: ReflexiveKind,
+    kind: ObjectForm,
     shim: &Ident,
     method: &TraitItemFn,
 ) -> syn::Result<Option<TokenStream2>> {
@@ -1735,7 +1798,7 @@ fn reflexive_method(
         false
     } else if method.default.is_some() {
         return Ok(None);
-    } else if helper_of(method) == Some(Helper::Panic) {
+    } else if Helper::of(method) == Some(Helper::Panic) {
         true
     } else {
         let name = &method.sig.ident;
@@ -1752,7 +1815,7 @@ fn reflexive_method(
 
     // `reflexive = bare` impls for the unsized `dyn` type, so an emitted method
     // must not place `Self` by value.
-    if kind == ReflexiveKind::Bare
+    if kind == ObjectForm::Bare
         && let Some(err) = bare_inexpressible(method)
     {
         return Err(err);
@@ -1762,21 +1825,8 @@ fn reflexive_method(
     // resolves to the impl's self type), renaming arguments so the body can
     // forward them. Only `#[cfg]` gates carry over, matching `forward`.
     let mut sig = method.sig.clone();
-    let mut names = Vec::new();
-    for (i, arg) in sig.inputs.iter_mut().skip(1).enumerate() {
-        let FnArg::Typed(pat) = arg else { continue };
-        let id = match &*pat.pat {
-            Pat::Ident(p) if p.by_ref.is_none() && p.subpat.is_none() => p.ident.clone(),
-            _ => format_ident!("__a{i}"),
-        };
-        *pat.pat = syn::parse_quote! { #id };
-        names.push(id);
-    }
-    let cfg_attrs: Vec<&Attribute> = method
-        .attrs
-        .iter()
-        .filter(|a| a.path().is_ident("cfg"))
-        .collect();
+    let names = rename_args(&mut sig);
+    let cfg_attrs = cfg_gates(method);
 
     let body = if stub {
         let msg = format!(
@@ -1790,7 +1840,7 @@ fn reflexive_method(
             Some(FnArg::Receiver(recv)) => recv,
             _ => unreachable!("a forwarded method has a receiver"),
         };
-        let recv_expr = reflexive_receiver(kind, recv, name)?;
+        let recv_expr = kind.reflexive_receiver(recv, name)?;
         // Dispatch through the shim trait by name, so `Self` infers to the
         // `dyn` type (vtable dispatch to the concrete implementor). Calling the
         // source method on `self` instead would resolve right back to this impl
@@ -1805,40 +1855,38 @@ fn reflexive_method(
     }))
 }
 
-/// The receiver expression passed to the shim method when forwarding through
-/// the reflexive impl. Adjusts for the impl's self type: `Box<dyn Shim>`
-/// (boxed) dereferences to reach the `dyn` type, while `dyn Shim` (bare) is
-/// already there.
-fn reflexive_receiver(
-    kind: ReflexiveKind,
-    recv: &Receiver,
-    name: &Ident,
-) -> syn::Result<TokenStream2> {
-    let expr = match (kind, classify_receiver(recv)) {
-        // By-value `self`: boxed's self is `Box<dyn Shim>`, which is exactly the
-        // shim method's `self: Box<Self>`. (Bare never reaches here: a by-value
-        // receiver is rejected earlier as inexpressible.)
-        (_, ReceiverKind::Value) => quote! { self },
-        // `Box<Self>` source receiver: boxed's self is `Box<Box<dyn Shim>>`, so
-        // peel one box; bare's self is already `Box<dyn Shim>`.
-        (ReflexiveKind::Boxed, ReceiverKind::Boxed) => quote! { *self },
-        (ReflexiveKind::Bare, ReceiverKind::Boxed) => quote! { self },
-        // `&self` / `&mut self`: boxed reborrows through the box to the `dyn`
-        // type; bare's receiver already is `&dyn Shim`.
-        (ReflexiveKind::Boxed, ReceiverKind::Ref) => quote! { &**self },
-        (ReflexiveKind::Boxed, ReceiverKind::RefMut) => quote! { &mut **self },
-        (ReflexiveKind::Bare, ReceiverKind::Ref | ReceiverKind::RefMut) => quote! { self },
-        (_, ReceiverKind::Other) => {
-            return Err(syn::Error::new_spanned(
-                recv,
-                format!(
-                    "`{name}`'s `self` receiver is not yet supported in a reflexive impl \
+impl ObjectForm {
+    /// The receiver expression passed to the shim method when forwarding through
+    /// the reflexive impl. Adjusts for the impl's self type: `Box<dyn Shim>`
+    /// (boxed) dereferences to reach the `dyn` type, while `dyn Shim` (bare) is
+    /// already there.
+    fn reflexive_receiver(self, recv: &Receiver, name: &Ident) -> syn::Result<TokenStream2> {
+        let expr = match (self, ReceiverKind::of(recv)) {
+            // By-value `self`: boxed's self is `Box<dyn Shim>`, which is exactly the
+            // shim method's `self: Box<Self>`. (Bare never reaches here: a by-value
+            // receiver is rejected earlier as inexpressible.)
+            (_, ReceiverKind::Value) => quote! { self },
+            // `Box<Self>` source receiver: boxed's self is `Box<Box<dyn Shim>>`, so
+            // peel one box; bare's self is already `Box<dyn Shim>`.
+            (ObjectForm::Boxed, ReceiverKind::Boxed) => quote! { *self },
+            (ObjectForm::Bare, ReceiverKind::Boxed) => quote! { self },
+            // `&self` / `&mut self`: boxed reborrows through the box to the `dyn`
+            // type; bare's receiver already is `&dyn Shim`.
+            (ObjectForm::Boxed, ReceiverKind::Ref) => quote! { &**self },
+            (ObjectForm::Boxed, ReceiverKind::RefMut) => quote! { &mut **self },
+            (ObjectForm::Bare, ReceiverKind::Ref | ReceiverKind::RefMut) => quote! { self },
+            (_, ReceiverKind::Other) => {
+                return Err(syn::Error::new_spanned(
+                    recv,
+                    format!(
+                        "`{name}`'s `self` receiver is not yet supported in a reflexive impl \
                      (only `self`, `&self`, `&mut self`, and `self: Box<Self>` are)"
-                ),
-            ));
-        }
-    };
-    Ok(expr)
+                    ),
+                ));
+            }
+        };
+        Ok(expr)
+    }
 }
 
 /// How a forwarded method's receiver is shaped, for reflexive forwarding.
@@ -1855,21 +1903,24 @@ enum ReceiverKind {
     Other,
 }
 
-fn classify_receiver(recv: &Receiver) -> ReceiverKind {
-    if recv.reference.is_some() {
-        if recv.mutability.is_some() {
-            ReceiverKind::RefMut
+impl ReceiverKind {
+    /// Classify a method's `self` receiver by its shape.
+    fn of(recv: &Receiver) -> ReceiverKind {
+        if recv.reference.is_some() {
+            if recv.mutability.is_some() {
+                ReceiverKind::RefMut
+            } else {
+                ReceiverKind::Ref
+            }
+        } else if recv.colon_token.is_none()
+            || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self"))
+        {
+            ReceiverKind::Value
+        } else if is_box_self(&recv.ty) {
+            ReceiverKind::Boxed
         } else {
-            ReceiverKind::Ref
+            ReceiverKind::Other
         }
-    } else if recv.colon_token.is_none()
-        || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self"))
-    {
-        ReceiverKind::Value
-    } else if is_box_self(&recv.ty) {
-        ReceiverKind::Boxed
-    } else {
-        ReceiverKind::Other
     }
 }
 
@@ -1895,19 +1946,16 @@ fn bare_inexpressible(method: &TraitItemFn) -> Option<syn::Error> {
     let sig = &method.sig;
     let name = &sig.ident;
 
-    if let Some(FnArg::Receiver(recv)) = sig.inputs.first() {
-        let by_value = recv.reference.is_none()
-            && (recv.colon_token.is_none()
-                || matches!(&*recv.ty, Type::Path(p) if p.qself.is_none() && p.path.is_ident("Self")));
-        if by_value {
-            return Some(syn::Error::new_spanned(
-                recv,
-                format!(
-                    "`reflexive = bare` cannot include `{name}`: its by-value `self` receiver \
-                     would take the unsized `dyn` shim by value. Use `reflexive = boxed`."
-                ),
-            ));
-        }
+    if let Some(FnArg::Receiver(recv)) = sig.inputs.first()
+        && matches!(ReceiverKind::of(recv), ReceiverKind::Value)
+    {
+        return Some(syn::Error::new_spanned(
+            recv,
+            format!(
+                "`reflexive = bare` cannot include `{name}`: its by-value `self` receiver \
+                 would take the unsized `dyn` shim by value. Use `reflexive = boxed`."
+            ),
+        ));
     }
 
     if let ReturnType::Type(_, ty) = &sig.output
@@ -2003,7 +2051,7 @@ enum Helper {
 /// reason it is skipped. Return `None` when the method is forwarded.
 fn skip(method: &TraitItemFn) -> Option<&'static str> {
     let sig = &method.sig;
-    if helper_of(method) == Some(Helper::Skip) {
+    if Helper::of(method) == Some(Helper::Skip) {
         Some("opted out with #[dyn_shim(skip)]")
     } else if sig.asyncness.is_some() {
         Some("async fn")
@@ -2020,36 +2068,38 @@ fn skip(method: &TraitItemFn) -> Option<&'static str> {
     }
 }
 
-/// Parse a method's `#[dyn_shim(...)]` attribute, which must carry exactly one
-/// of the supported arguments, `skip` or `panic`.
-fn parse_helper(attr: &Attribute) -> syn::Result<Helper> {
-    let mut helper = None;
-    attr.parse_nested_meta(|meta| {
-        let which = if meta.path.is_ident("skip") {
-            Helper::Skip
-        } else if meta.path.is_ident("panic") {
-            Helper::Panic
-        } else {
-            return Err(meta.error("unsupported dyn_shim argument, expected `skip` or `panic`"));
-        };
-        if helper.replace(which).is_some() {
-            return Err(meta.error("duplicate dyn_shim argument"));
-        }
-        Ok(())
-    })?;
-    helper.ok_or_else(|| {
-        syn::Error::new_spanned(attr, "expected #[dyn_shim(skip)] or #[dyn_shim(panic)]")
-    })
-}
+impl Helper {
+    /// Parse a method's `#[dyn_shim(...)]` attribute, which must carry exactly
+    /// one of the supported arguments, `skip` or `panic`.
+    fn parse(attr: &Attribute) -> syn::Result<Helper> {
+        let mut helper = None;
+        attr.parse_nested_meta(|meta| {
+            let which = if meta.path.is_ident("skip") {
+                Helper::Skip
+            } else if meta.path.is_ident("panic") {
+                Helper::Panic
+            } else {
+                return Err(meta.error("unsupported dyn_shim argument, expected `skip` or `panic`"));
+            };
+            if helper.replace(which).is_some() {
+                return Err(meta.error("duplicate dyn_shim argument"));
+            }
+            Ok(())
+        })?;
+        helper.ok_or_else(|| {
+            syn::Error::new_spanned(attr, "expected #[dyn_shim(skip)] or #[dyn_shim(panic)]")
+        })
+    }
 
-/// The helper argument on a method's `#[dyn_shim(...)]` attribute, if any. The
-/// arguments were validated up front, so parsing cannot fail here.
-fn helper_of(method: &TraitItemFn) -> Option<Helper> {
-    let attr = method
-        .attrs
-        .iter()
-        .find(|a| a.path().is_ident("dyn_shim"))?;
-    parse_helper(attr).ok()
+    /// The helper argument on a method's `#[dyn_shim(...)]` attribute, if any.
+    /// The arguments were validated up front, so parsing cannot fail here.
+    fn of(method: &TraitItemFn) -> Option<Helper> {
+        let attr = method
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("dyn_shim"))?;
+        Helper::parse(attr).ok()
+    }
 }
 
 /// True if the first parameter is a `self` receiver (`&self`, `&mut self`,
