@@ -1,3 +1,8 @@
+// These cases shell out to cargo through trybuild, which Miri cannot run under
+// its filesystem isolation. Under Miri the whole target compiles to no tests,
+// so `cargo +nightly miri test` runs only the behavioral suite in `it.rs`.
+#![cfg(not(miri))]
+
 // Each case applies `#[dyn_shim(Dyn)]` to a trait containing one method that is
 // not dyn-compatible, then tries to reach that method through `dyn Dyn`. The
 // method must be absent from the generated shim, so each program must fail to
