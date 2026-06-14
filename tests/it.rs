@@ -901,3 +901,136 @@ fn hash_bound_shim_upcasts_to_dyn_hash() {
     let erased: &dyn dyn_shim::DynHash = color; // trait upcast
     assert_eq!(bh.hash_one(erased), bh.hash_one(&Red));
 }
+
+// `#[trait_object(Hash)]` bolts the recognized `Hash` capability onto a trait
+// the user owns that is already dyn-compatible, generating no shim. The trait
+// carries the `DynHash` carrier as an explicit supertrait, and the attribute
+// emits `impl Hash for dyn Tagged`, which also covers `&dyn Tagged` and (through
+// std's forwarding impl) `Box<dyn Tagged>`.
+#[cfg(feature = "dyn_hash")]
+mod trait_object_hash {
+    use dyn_shim::{DynHash, trait_object};
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+    #[trait_object(Hash)]
+    trait Tagged: DynHash {
+        fn tag(&self) -> u32;
+    }
+
+    #[derive(Hash)]
+    struct Label(u32);
+    impl Tagged for Label {
+        fn tag(&self) -> u32 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn dyn_trait_is_hash() {
+        let bh = BuildHasherDefault::<DefaultHasher>::default();
+        let boxed: Box<dyn Tagged> = Box::new(Label(5));
+        let by_ref: &dyn Tagged = &Label(5);
+        // The trait's own methods still work; the attribute only adds the impl.
+        assert_eq!(boxed.tag(), 5);
+        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Label(5)));
+        assert_eq!(bh.hash_one(by_ref), bh.hash_one(&Label(5)));
+        // Box<dyn Tagged> hashes via std's forwarding impl for Box<T: Hash>.
+        assert_eq!(bh.hash_one(&boxed), bh.hash_one(&Label(5)));
+        assert_ne!(bh.hash_one(by_ref), bh.hash_one(&Label(6)));
+    }
+}
+
+// `#[trait_object(Clone)]` makes `Box<dyn Drawing>` cloneable and `dyn Drawing`
+// `ToOwned`, cloning the underlying concrete value into a fresh box. The carrier
+// is the `DynClone` supertrait.
+#[cfg(feature = "dyn_clone")]
+mod trait_object_clone {
+    use dyn_shim::{DynClone, trait_object};
+
+    #[trait_object(Clone)]
+    trait Drawing: DynClone {
+        fn area(&self) -> u32;
+    }
+
+    #[derive(Clone)]
+    struct Rect {
+        w: u32,
+        h: u32,
+    }
+    impl Drawing for Rect {
+        fn area(&self) -> u32 {
+            self.w * self.h
+        }
+    }
+
+    #[test]
+    fn boxed_dyn_trait_clones() {
+        let original: Box<dyn Drawing> = Box::new(Rect { w: 2, h: 3 });
+        let copy = original.clone();
+        assert_eq!(copy.area(), 6);
+        // The clone is an independent allocation: dropping the original leaves
+        // the copy intact.
+        drop(original);
+        assert_eq!(copy.area(), 6);
+    }
+
+    #[test]
+    fn dyn_trait_to_owned_escapes_borrow() {
+        use std::borrow::Cow;
+
+        let rect = Rect { w: 4, h: 5 };
+        let borrowed: &dyn Drawing = &rect;
+        let owned: Box<dyn Drawing> = borrowed.to_owned();
+        assert_eq!(owned.area(), 20);
+
+        let cow: Cow<'_, dyn Drawing> = Cow::Borrowed(borrowed);
+        assert_eq!(cow.into_owned().area(), 20);
+    }
+}
+
+// Hash and Clone combine in one attribute, and listed auto traits select the
+// covered `dyn` marker variants, exactly as for a recognized bound.
+#[cfg(all(feature = "dyn_clone", feature = "dyn_hash"))]
+mod trait_object_combined {
+    use dyn_shim::{DynClone, DynHash, trait_object};
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+    #[trait_object(Hash + Clone + Send + Sync)]
+    trait Node: DynHash + DynClone {
+        fn id(&self) -> u32;
+    }
+
+    #[derive(Hash, Clone)]
+    struct Leaf(u32);
+    impl Node for Leaf {
+        fn id(&self) -> u32 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn plain_dyn_is_hash_and_clone() {
+        let bh = BuildHasherDefault::<DefaultHasher>::default();
+        let boxed: Box<dyn Node> = Box::new(Leaf(3));
+        assert_eq!(boxed.clone().id(), 3);
+        assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Leaf(3)));
+    }
+
+    #[test]
+    fn marker_variants_covered() {
+        let bh = BuildHasherDefault::<DefaultHasher>::default();
+
+        // `+ Send` clones and crosses a thread boundary.
+        let send: Box<dyn Node + Send> = Box::new(Leaf(4));
+        let copy = send.clone();
+        assert_eq!(std::thread::spawn(move || copy.id()).join().unwrap(), 4);
+
+        // `+ Send + Sync`, in any order, hashes through its own impl.
+        let both: &(dyn Node + Sync + Send) = &Leaf(4);
+        assert_eq!(bh.hash_one(both), bh.hash_one(&Leaf(4)));
+
+        // `+ Sync` is cloneable too.
+        let sync: Box<dyn Node + Sync> = Box::new(Leaf(4));
+        assert_eq!(sync.clone().id(), 4);
+    }
+}

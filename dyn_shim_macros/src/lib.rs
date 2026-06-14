@@ -126,6 +126,22 @@ impl Parse for RecognizedArgs {
     }
 }
 
+/// Arguments to [`macro@trait_object`]: a list of recognized std traits
+/// (`Clone`, `Hash`) to implement for the annotated trait's `dyn` objects,
+/// optionally followed by auto-trait markers selecting the covered `dyn`
+/// variants, written like a bound list (`Hash + Clone + Send`).
+struct TraitObjectArgs {
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+}
+
+impl Parse for TraitObjectArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(TraitObjectArgs {
+            bounds: Punctuated::parse_separated_nonempty(input)?,
+        })
+    }
+}
+
 /// The bound's trait path, if the bound is a plain trait name with no
 /// modifier or binder. Recognition applies only to bounds written bare:
 /// a modified or higher-ranked bound (`?Sized`, `for<'a> Fn(&'a str)`)
@@ -1029,6 +1045,224 @@ pub fn dyn_shim_recognized(attr: TokenStream, item: TokenStream) -> TokenStream 
     expand_recognized(&input, bounds)
 }
 
+/// Implement a recognized std trait (`Clone`, `Hash`) for the trait objects of
+/// an dyn-compatible trait you already own, without generating a shim.
+///
+/// [`macro@dyn_shim`] and [`macro@dyn_shim_foreign`] build a *new*
+/// dyn-compatible trait from one that is not. This attribute is for the case
+/// where the trait is already dyn-compatible and you only want its `dyn`
+/// objects to gain a recognized capability. It generates no trait and no
+/// blanket impl: it re-emits the annotated trait untouched and adds the impls
+/// that make its trait objects `Clone` and/or `Hash`.
+///
+/// The capability rides on a carrier the trait must already inherit: list
+/// `DynClone` and/or `DynHash` (from this crate, behind the matching feature)
+/// as supertraits, and the attribute fills in the rest. The supertrait is
+/// written explicitly so a reader of the trait sees that every implementor must
+/// be `DynClone` / `DynHash`:
+///
+/// ```
+/// use dyn_shim::{DynHash, trait_object};
+/// use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+///
+/// #[trait_object(Hash)]
+/// trait Event: DynHash {
+///     fn name(&self) -> &str;
+/// }
+///
+/// #[derive(Hash)]
+/// struct Tick(u64);
+/// impl Event for Tick {
+///     fn name(&self) -> &str { "tick" }
+/// }
+///
+/// // `dyn Event` (and so `&dyn Event` and `Box<dyn Event>`) implements `Hash`.
+/// let bh = BuildHasherDefault::<DefaultHasher>::default();
+/// let boxed: Box<dyn Event> = Box::new(Tick(7));
+/// assert_eq!(bh.hash_one(&*boxed), bh.hash_one(&Tick(7)));
+/// ```
+///
+/// `Clone` and `Hash` may be combined (`#[trait_object(Hash + Clone)]`), and
+/// auto-trait markers select the covered `dyn` variants exactly as in a
+/// [recognized bound](macro@dyn_shim#recognized-bounds): `#[trait_object(Clone +
+/// Send)]` makes both `Box<dyn Foo>` and `Box<dyn Foo + Send>` cloneable.
+/// `Clone` also implements `ToOwned` for the `dyn` type.
+///
+/// # How It Differs From a Recognized Bound
+///
+/// `#[dyn_shim(DynFoo: Hash)]` generates a separate `DynFoo` shim and bounds its
+/// blanket impl by `Hash`, so a non-`Hash` implementor of `Foo` simply never
+/// becomes a `DynFoo`. `#[trait_object(Hash)]` adds no shim and instead requires
+/// the carrier as a supertrait of `Foo` itself, so the contract is stricter:
+/// *every* implementor of `Foo` must be `Hash`. Reach for this attribute when
+/// `Foo` is already dyn-compatible and `dyn Foo` is the type you use directly;
+/// reach for the shim when `Foo` is not dyn-compatible or when only some
+/// implementors are `Hash`.
+///
+/// Like the recognized bounds, the carrier supertrait is matched by bare name
+/// (`DynClone`, `DynHash`), the same token-match convention as the rest of the
+/// crate: a missing carrier is reported at the attribute, and a user trait that
+/// happens to be named `DynHash` is accepted in its place.
+#[proc_macro_attribute]
+pub fn trait_object(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let TraitObjectArgs { bounds } = parse_macro_input!(attr as TraitObjectArgs);
+    let input = parse_macro_input!(item as ItemTrait);
+    expand_trait_object(&input, bounds)
+}
+
+/// Expansion for [`macro@trait_object`]: re-emit the annotated trait unchanged
+/// and append the impls that make its `dyn` objects `Clone`/`Hash`. The carrier
+/// methods are inherited from the `DynClone`/`DynHash` supertraits, so unlike
+/// the recognized-bound machinery this emits only the bridge impls.
+fn expand_trait_object(
+    input: &ItemTrait,
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+) -> TokenStream {
+    if let Some(param) = input.generics.params.first() {
+        return syn::Error::new_spanned(param, "trait_object does not support generic traits")
+            .to_compile_error()
+            .into();
+    }
+
+    let mut recognized = Vec::new();
+    let mut autos = Vec::new();
+    for bound in &bounds {
+        match classify(bound) {
+            Classified::Recognized(k) => {
+                if !recognized.contains(&k) {
+                    recognized.push(k);
+                }
+            }
+            Classified::Auto(auto) => {
+                if !autos.contains(&auto) {
+                    autos.push(auto);
+                }
+            }
+            Classified::Rejected(msg) => {
+                return syn::Error::new_spanned(bound, msg)
+                    .to_compile_error()
+                    .into();
+            }
+            Classified::PassThrough => {
+                return syn::Error::new_spanned(
+                    bound,
+                    "trait_object expects recognized traits (`Clone` or `Hash`), optionally \
+                     followed by auto-trait markers",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+    if recognized.is_empty() {
+        return syn::Error::new_spanned(
+            &bounds,
+            "trait_object expects at least one recognized trait (`Clone` or `Hash`)",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Each recognized capability rides on a carrier supertrait the annotated
+    // trait must already inherit. Report a missing one here, at the attribute,
+    // rather than letting the bridge's call to the inherited method fail to
+    // compile on generated code.
+    for k in &recognized {
+        if let Err(err) = require_carrier(input, *k) {
+            return err.to_compile_error().into();
+        }
+    }
+
+    let trait_ident = &input.ident;
+    let combos = marker_combos(&autos);
+    let mut bridges = TokenStream2::new();
+    for k in &recognized {
+        bridges.extend(trait_object_bridge(*k, trait_ident, &combos));
+    }
+
+    quote! {
+        #input
+        #bridges
+    }
+    .into()
+}
+
+/// Check that the annotated trait inherits the carrier supertrait a recognized
+/// capability needs (`DynClone` for `Clone`, `DynHash` for `Hash`). A
+/// bare-name token match, like [`classify`].
+fn require_carrier(input: &ItemTrait, k: RecognizedBound) -> syn::Result<()> {
+    let (carrier, capability) = match k {
+        RecognizedBound::Clone => ("DynClone", "Clone"),
+        RecognizedBound::Hash => ("DynHash", "Hash"),
+    };
+    let present = input.supertraits.iter().any(|bound| {
+        plain_trait_bound(bound)
+            .and_then(|path| path.segments.last())
+            .is_some_and(|seg| seg.ident == carrier)
+    });
+    if present {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            &input.ident,
+            format!(
+                "trait_object({capability}) needs `{carrier}` as a supertrait; \
+                 write `trait {}: {carrier}`",
+                input.ident
+            ),
+        ))
+    }
+}
+
+/// The bridge impls for one recognized capability on `dyn TraitIdent + markers`,
+/// one per marker combination. Each forwards to the carrier method inherited
+/// from the `DynClone`/`DynHash` supertrait.
+fn trait_object_bridge(
+    k: RecognizedBound,
+    trait_ident: &Ident,
+    combos: &[MarkerCombo],
+) -> TokenStream2 {
+    let mut out = TokenStream2::new();
+    match k {
+        // `Hash` is implemented on `dyn Trait` itself, which also covers
+        // `&dyn Trait` and, through std's forwarding impl, `Box<dyn Trait>`.
+        // The carrier erases the generic hasher to `&mut dyn Hasher`.
+        RecognizedBound::Hash => {
+            for MarkerCombo { markers, .. } in combos {
+                out.extend(quote! {
+                    impl ::std::hash::Hash for dyn #trait_ident #markers {
+                        fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
+                            <Self as ::dyn_shim::DynHash>::__dyn_shim_hash(self, state)
+                        }
+                    }
+                });
+            }
+        }
+        // `Clone` is implemented on `Box<dyn Trait>` (the sized owner), and
+        // `ToOwned` on `dyn Trait` for callers holding only a borrow. Both clone
+        // the concrete value into a fresh `Box<dyn Trait>` via the carrier.
+        RecognizedBound::Clone => {
+            for MarkerCombo { markers, .. } in combos {
+                out.extend(quote! {
+                    impl ::std::clone::Clone for ::std::boxed::Box<dyn #trait_ident #markers> {
+                        fn clone(&self) -> Self {
+                            ::dyn_shim::__clone_box(&**self)
+                        }
+                    }
+
+                    impl ::std::borrow::ToOwned for dyn #trait_ident #markers {
+                        type Owned = ::std::boxed::Box<dyn #trait_ident #markers>;
+                        fn to_owned(&self) -> Self::Owned {
+                            ::dyn_shim::__clone_box(self)
+                        }
+                    }
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Render a path as `a::b::C` for doc links, dropping any generic arguments.
 fn path_doc_string(path: &Path) -> String {
     let mut out = String::new();
@@ -1269,9 +1503,12 @@ fn expand_recognized(
     bounds: Punctuated<TypeParamBound, Token![+]>,
 ) -> TokenStream {
     if let Some(param) = input.generics.params.first() {
-        return syn::Error::new_spanned(param, "dyn_shim_recognized does not support generic shims")
-            .to_compile_error()
-            .into();
+        return syn::Error::new_spanned(
+            param,
+            "dyn_shim_recognized does not support generic shims",
+        )
+        .to_compile_error()
+        .into();
     }
     if let Some(item) = input.items.first() {
         return syn::Error::new_spanned(
@@ -1808,7 +2045,10 @@ fn parse_helper(attr: &Attribute) -> syn::Result<Helper> {
 /// The helper argument on a method's `#[dyn_shim(...)]` attribute, if any. The
 /// arguments were validated up front, so parsing cannot fail here.
 fn helper_of(method: &TraitItemFn) -> Option<Helper> {
-    let attr = method.attrs.iter().find(|a| a.path().is_ident("dyn_shim"))?;
+    let attr = method
+        .attrs
+        .iter()
+        .find(|a| a.path().is_ident("dyn_shim"))?;
     parse_helper(attr).ok()
 }
 

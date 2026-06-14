@@ -15,23 +15,34 @@
 //! the shim's trait object satisfy the source trait itself, so it can be passed
 //! to code written against the original.
 //!
-//! # Ready-made shims
+//! # Dyn `Clone` and `Hash`
 //!
 //! `Clone` and `Hash` cannot be supertraits of a dyn-compatible trait, so they
 //! cannot be shimmed by restating them. This crate ships their shims directly,
-//! each behind a feature, as drop-in equivalents of the `dyn-clone` and
-//! `dyn-hash` crates:
+//! each behind a feature, as drop-in equivalents of the `dyn_clone` and
+//! `dyn_hash` crates:
+//!
+//! To give a trait of your own these capabilities, list `Clone`/`Hash` as
+//! [bounds](macro@dyn_shim#recognized-bounds) on a [`macro@dyn_shim`] shim, or,
+//! when the trait is already dyn-compatible, add them to its trait objects in
+//! place with [`macro@trait_object`] (gated on the `dyn_clone` and `dyn_hash`
+//! features).
 //!
 //! - With the `dyn_clone` feature, [`DynClone`]: `Box<dyn DynClone>` implements
-//!   [`Clone`] and `dyn DynClone` implements [`ToOwned`].
-//! - With the `dyn_hash` feature, [`DynHash`]: `dyn DynHash` implements [`Hash`],
-//!   covering `Box<dyn DynHash>` through the standard library's forwarding impl.
+//! [`Clone`] and `dyn DynClone` implements [`ToOwned`].
+//! - With the `dyn_hash` feature, [`DynHash`]: `dyn DynHash` implements
+//! [`Hash`], covering `Box<dyn DynHash>` through the standard library's
+//! forwarding impl.
 //!
-//! Both cover the `+ Send` and `+ Sync` marker variants. To shim `Clone` or
-//! `Hash` as part of a larger trait instead, list them as
-//! [bounds](macro@dyn_shim#recognized-bounds) on a `#[dyn_shim]` shim.
+//! Both cover the `+ Send` and `+ Sync` marker variants.
 
 pub use dyn_shim_macros::{dyn_shim, dyn_shim_foreign};
+
+// `trait_object` only implements `Clone`/`Hash`, whose carriers are `DynClone`
+// and `DynHash`. With neither feature on there is no carrier to bolt onto a
+// trait, so the attribute would be unusable; gate it on having at least one.
+#[cfg(any(feature = "dyn_clone", feature = "dyn_hash"))]
+pub use dyn_shim_macros::trait_object;
 
 // The machinery behind the ready-made shims below. It is not part of this
 // crate's public API (the shims are), so it is re-exported only to define them
@@ -62,6 +73,41 @@ pub use dyn_shim_macros::dyn_shim_recognized;
 #[cfg(feature = "dyn_clone")]
 #[dyn_shim_recognized(Clone + Send + Sync)]
 pub trait DynClone {}
+
+/// Clone the concrete value behind a `dyn` trait object that carries the
+/// [`DynClone`] machinery, into a fresh `Box` of that same trait object type.
+/// This backs the [`trait_object`](macro@trait_object) attribute's `Clone`
+/// support: a `Box<dyn Foo>` where `Foo: DynClone` is cloned by duplicating the
+/// underlying concrete value and re-boxing it as `dyn Foo`.
+///
+/// It is not part of the public API; the attribute references it by absolute
+/// path in its generated `Clone` impl.
+#[cfg(feature = "dyn_clone")]
+#[doc(hidden)]
+pub fn __clone_box<T: ?Sized + DynClone + 'static>(value: &T) -> Box<T> {
+    // The carrier clones the concrete value into a `Box<dyn DynClone>`: a fresh
+    // allocation laid out exactly as the concrete type behind `value`. We want
+    // that allocation typed as `Box<T>` (e.g. `Box<dyn Foo>`), which holds the
+    // same data but carries `T`'s metadata. `DynClone`'s vtable cannot produce
+    // `T`'s, so take the fresh data pointer and splice in `T`'s metadata, read
+    // from `value`.
+    let cloned: Box<dyn DynClone> = value.__dyn_shim_clone_box();
+    let data: *mut () = Box::into_raw(cloned) as *mut ();
+    let mut fat: *const T = value;
+    // SAFETY: `fat` points to `T`, and its metadata describes the concrete type
+    // behind `value`, which is exactly the type `cloned` holds, so the metadata
+    // is valid for the freshly cloned value. We overwrite only the data half of
+    // the pointer with the clone's address (the `assert_eq!` confirms that half
+    // is the leading pointer-sized field), then reconstruct an owned `Box<T>`
+    // over the clone's allocation. Dropping it uses `T`'s size and align from
+    // the metadata, matching the allocation the carrier made for that type.
+    unsafe {
+        let slot = &mut fat as *mut *const T as *mut *mut ();
+        assert_eq!(*slot as *const (), value as *const T as *const ());
+        *slot = data;
+        Box::from_raw(fat as *mut T)
+    }
+}
 
 /// A dyn-compatible shim for [`Hash`].
 ///

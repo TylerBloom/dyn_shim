@@ -129,6 +129,35 @@ subtrait of `DynClone`/`DynHash`, so `Box<dyn DynFoo>` (or `&dyn DynFoo`)
 upcasts to `Box<dyn DynClone>` (or `&dyn DynHash`) and flows into APIs typed
 against those.
 
+## Capabilities on an existing trait
+
+`#[dyn_shim]` builds a new dyn-compatible trait from one that is not.
+`#[trait_object]` is for the other case: a trait you own that is already
+dyn-compatible, where you want only its trait objects to be `Clone` or `Hash`.
+It generates no shim. The trait lists `DynClone`/`DynHash` as supertraits to
+carry the machinery, and the attribute names the capabilities to implement, so
+`dyn Foo` itself becomes `Clone`/`Hash`:
+
+```rust
+use dyn_shim::{trait_object, DynClone, DynHash};
+
+#[trait_object(Hash + Clone)]
+trait Shape: DynHash + DynClone {
+    fn area(&self) -> u32;
+}
+
+// dyn Shape implements Hash, and Box<dyn Shape> implements Clone.
+```
+
+`Clone` and `Hash` may be listed together, and auto-trait markers
+(`#[trait_object(Clone + Send)]`) select the covered `dyn` variants, like a
+recognized bound. The difference from `#[dyn_shim(DynShape: Hash)]` is the
+contract: the carrier is a supertrait of `Shape`, so every implementor of
+`Shape` must be `Hash`/`Clone`, whereas the shim form only filters which
+implementors become the shim. Reach for `#[trait_object]` when `dyn Foo` is the
+type you use directly. `Hash` requires the `dyn_hash` feature and `Clone` the
+`dyn_clone` feature, since those define the carriers.
+
 See the [API documentation](https://docs.rs/dyn_shim) for details.
 
 ## Testing

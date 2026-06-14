@@ -90,3 +90,17 @@ fn recognized_misuse_rejected() {
     t.compile_fail("tests/ui/recognized_unknown_trait.rs");
     t.compile_fail("tests/ui/recognized_has_items.rs");
 }
+
+// `trait_object` adds a recognized capability to a trait that already inherits
+// its carrier. It rejects a missing carrier supertrait, an argument list with no
+// recognized trait, and a pass-through trait it has no machinery for. All three
+// errors come from the macro itself, so the snapshots are stable across
+// toolchains. The attribute is feature-gated, so these run only when it exists.
+#[cfg(any(feature = "dyn_clone", feature = "dyn_hash"))]
+#[test]
+fn trait_object_misuse_rejected() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/trait_object_missing_carrier.rs");
+    t.compile_fail("tests/ui/trait_object_no_recognized.rs");
+    t.compile_fail("tests/ui/trait_object_passthrough.rs");
+}

@@ -10,13 +10,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  test:
 
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # `DynClone`, `DynHash`, and `trait_object` are feature-gated, so cover
+        # no features, each on its own, and both together.
+        features:
+          - ""
+          - "dyn_clone"
+          - "dyn_hash"
+          - "dyn_clone dyn_hash"
+
+    name: test (features:${{ matrix.features }})
 
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --verbose --features "${{ matrix.features }}"
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --verbose --features "${{ matrix.features }}"
