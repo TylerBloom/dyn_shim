@@ -33,8 +33,16 @@ dyn_shim_macros = { version = "0.2.0", path = "dyn_shim_macros" }
 [dev-dependencies]
 trybuild = "1.0"
 
-# `#[trait_object]` rides on the `DynHash`/`DynClone` carriers, so this example
-# needs both features.
+# `#[trait_object]` rides on the `DynHash`/`DynClone` carriers, so these examples
+# need the matching feature.
 [[example]]
 name = "trait_object"
 required-features = ["dyn_hash", "dyn_clone"]
+
+[[example]]
+name = "migrate_dyn_clone"
+required-features = ["dyn_clone"]
+
+[[example]]
+name = "migrate_dyn_hash"
+required-features = ["dyn_hash"]

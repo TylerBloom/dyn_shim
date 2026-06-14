@@ -1,13 +1,14 @@
-//! Converting the `dyn-hash` README example to `#[dyn_shim]`, and why the
-//! result is better.
+//! Migrating the `dyn-hash` README example to `#[trait_object]`.
 //!
-//! The original program:
+//! `dyn-hash` makes a `Box<dyn MyTrait>` hashable in two pieces: a `DynHash`
+//! supertrait that carries the erased hashing, and a `hash_trait_object!` macro
+//! call that implements `Hash` for `dyn MyTrait`. The original program:
 //!
 //! ```ignore
 //! use dyn_hash::DynHash;
 //!
 //! trait MyTrait: DynHash {
-//!     /* ... */
+//!     fn recite(&self);
 //! }
 //!
 //! // Implement std::hash::Hash for dyn MyTrait
@@ -20,66 +21,45 @@
 //! }
 //! ```
 //!
-//! `#[dyn_shim(DynMyTrait: Hash)]` replaces both the `: DynHash` supertrait and
-//! the `hash_trait_object!` call, and improves on them:
+//! The `dyn_shim` version keeps the trait, its `DynHash` supertrait, and the
+//! `dyn MyTrait` type unchanged. Two things move: the import points at
+//! `dyn_shim`, and the separate `hash_trait_object!(MyTrait)` call becomes a
+//! `#[trait_object(Hash)]` attribute on the trait. `dyn MyTrait` then implements
+//! `Hash`, covering `Box<dyn MyTrait>` through the standard library's forwarding
+//! impl, so the `Container` derive works as before.
 //!
-//! - Nothing extra to call. The attribute emits the `Hash` impl for the shim's
-//!   `dyn` types directly, so there is no separate `hash_trait_object!` step to
-//!   remember per trait.
-//! - The `Hash` bound applies only to types used through the shim, not to every
-//!   `MyTrait` implementor. A non-`Hash` type may still implement `MyTrait`; it
-//!   simply never becomes a `DynMyTrait`. To keep the original "all implementors
-//!   are `Hash`" contract, also write `trait MyTrait: Hash`.
-//!
-//! And nothing is lost: with the `dyn_hash` feature, `DynMyTrait` is a
-//! `dyn_shim::DynHash`, so the shim still satisfies `DynHash` bounds. A `&dyn
-//! DynMyTrait` upcasts to `&dyn DynHash` and flows wherever that is expected
-//! (see the tail of `main`).
-//!
-//! The conversion: swap the import for `dyn_shim`, move `: DynHash` into the
-//! attribute as `: Hash`, drop the `hash_trait_object!` call, and write `dyn
-//! DynMyTrait` for the trait object.
-//!
-//! Run with: `cargo run --example migrate_dyn_hash` (add `--features dyn_hash` for
-//! the `DynHash`-bound interop at the end).
+//! Run with: `cargo run --example migrate_dyn_hash --features dyn_hash`
 
-use dyn_shim::dyn_shim;
+use dyn_shim::{DynHash, trait_object};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-// Was: trait MyTrait: DynHash {
-#[dyn_shim(DynMyTrait: Hash)]
-trait MyTrait {
-    /* ... */
+#[trait_object(Hash)]
+trait MyTrait: DynHash {
+    fn recite(&self);
 }
 
-// Was: dyn_hash::hash_trait_object!(MyTrait); (dropped, no replacement)
+impl MyTrait for String {
+    fn recite(&self) {
+        println!("{} reporting in", self);
+    }
+}
 
-// Data structures containing Box<dyn DynMyTrait> can derive Hash:
 #[derive(Hash)]
 struct Container {
-    // Was: trait_object: Box<dyn MyTrait>,
-    trait_object: Box<dyn DynMyTrait>,
+    trait_object: Box<dyn MyTrait>,
 }
 
-// Added to make the example runnable; the README stops at the definitions.
-impl MyTrait for String {}
-
 fn main() {
+    let line = "The slithy structs did gyre and gimble the namespace";
     let container = Container {
-        trait_object: Box::new(String::from("jabberwock")),
+        trait_object: Box::new(String::from(line)),
     };
+    container.trait_object.recite();
 
-    // The derived Hash works even though the struct holds a trait object.
-    let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(&container);
-    println!("container hash: {hash:016x}");
-
-    // Our shim still plugs into DynHash code: a Box<dyn DynMyTrait> upcasts to
-    // Box<dyn DynHash>, which is `Hash` and hashes like the concrete value.
-    #[cfg(feature = "dyn_hash")]
-    {
-        let obj: Box<dyn DynMyTrait> = Box::new(String::from("jabberwock"));
-        let erased: Box<dyn dyn_shim::DynHash> = obj; // upcast
-        let h = BuildHasherDefault::<DefaultHasher>::default().hash_one(&*erased);
-        println!("via DynHash: {h:016x}");
-    }
+    let bh = BuildHasherDefault::<DefaultHasher>::default();
+    println!("container hash: {:016x}", bh.hash_one(&container));
+    assert_eq!(
+        bh.hash_one(&*container.trait_object),
+        bh.hash_one(&String::from(line))
+    );
 }

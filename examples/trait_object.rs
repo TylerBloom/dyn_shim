@@ -16,7 +16,6 @@
 //! Run with: `cargo run --example trait_object --features "dyn_hash dyn_clone"`
 
 use dyn_shim::{DynClone, DynHash, trait_object};
-use std::collections::HashSet;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
 #[trait_object(Hash + Clone)]
@@ -61,16 +60,13 @@ fn main() {
     println!("original widgets: {}", toolbar.len());
     println!("copy widgets:     {}", copy.len());
 
+    // dyn Widget is Hash, so a borrowed trait object (&dyn Widget) can be
+    // hashed directly. Hashing it matches hashing the concrete value.
     for w in &toolbar {
         println!("{:016x} {}", fingerprint(&**w), w.render());
     }
-
-    // dyn Widget is Hash, so trait objects can key a HashSet through their
-    // borrowed form. Hashing the object matches hashing the concrete value.
-    let mut seen: HashSet<u64> = HashSet::new();
-    for w in &toolbar {
-        seen.insert(fingerprint(&**w));
-    }
-    assert!(seen.contains(&fingerprint(&Button { label: "ok".into() })));
-    println!("distinct widget hashes: {}", seen.len());
+    assert_eq!(
+        fingerprint(&**toolbar.first().unwrap()),
+        fingerprint(&Button { label: "ok".into() }),
+    );
 }
